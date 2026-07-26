@@ -1,0 +1,21 @@
+.{
+    .name = .ajt,
+    .version = "0.0.1",
+    // Globally unique together with .name; generated once by the toolchain.
+    .fingerprint = 0x7e2e4e0d036a917d, // Changing this has security and trust implications.
+
+    // Pinned deliberately. Zig 0.16 removed std.Thread.Pool and moved
+    // Dir/File/cwd out of std.fs into std.Io, and Ajt lives on exactly those
+    // surfaces (filesystem, threading, HTTP, tar, compression). Toolchain
+    // upgrades are scheduled work here, not something to drift into.
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
