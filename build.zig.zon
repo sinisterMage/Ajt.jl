@@ -10,7 +10,32 @@
     // upgrades are scheduled work here, not something to drift into.
     .minimum_zig_version = "0.16.0",
 
-    .dependencies = .{},
+    .dependencies = .{
+        // libgit2, pinned to a release tarball and fetched LAZILY.
+        //
+        // Lazy is load-bearing, not tidiness: the whole point is that
+        // `zig build` and `zig build test` -- the two commands every
+        // contributor runs -- do not pull ~30 MB of C, and that a machine
+        // building only the pure-Zig half never needs the network. `-Dgit` is
+        // what asks for it (see build.zig).
+        //
+        // Not vendored, deliberately: `packages/ajt/` is a byte-identical
+        // mirror of the Ajt repository, and 30 MB of somebody else's C in it
+        // would make every `git log`, every diff and every clone of that mirror
+        // worse forever.
+        //
+        // Pinned to a tag rather than a branch because `src/git/c.zig` is
+        // hand-written `extern` declarations over libgit2's structs. A moved
+        // field is not a link error, it is a function pointer called with the
+        // wrong arguments -- so the version is asserted at runtime too
+        // (`git_libgit2_version`), and this hash is the other half of that
+        // check.
+        .libgit2 = .{
+            .url = "https://github.com/libgit2/libgit2/archive/refs/tags/v1.9.1.tar.gz",
+            .hash = "N-V-__8AAPAkMAHF73yNJSpdsQlf-mNs4jTb0NHpLoiNRzOw",
+            .lazy = true,
+        },
+    },
 
     .paths = .{
         "build.zig",

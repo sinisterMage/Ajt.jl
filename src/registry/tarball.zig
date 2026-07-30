@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const depot = @import("../depot.zig");
 
 pub const Error = error{
     DecompressFailed,
@@ -82,9 +83,22 @@ pub fn loadGzipped(gpa: Allocator, gz: []const u8) Error!Archive {
 }
 
 /// Convenience: read `<depot>/registries/<name>.tar.gz` and load it.
-pub fn loadFromDepot(gpa: Allocator, io: Io, depot: []const u8, name: []const u8) !Archive {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/registries/{s}.tar.gz", .{ depot, name });
+///
+/// The path comes from `depot.Depot.registryDir` rather than a local format
+/// string, so `registries/` is spelled where the layout is owned. `registryDir`
+/// documents exactly this shape -- "a directory or, on a squashed depot, a
+/// `<Name>.tar.gz` sibling; the caller decides which it found".
+///
+/// Not yet the only spelling left: `registry/aix.zig` still hand-joins
+/// `registries/<name>.toml` and its `scratchspaces/` cache paths. Those are the
+/// remaining ones to route through `depot.zig`.
+pub fn loadFromDepot(gpa: Allocator, io: Io, depot_root: []const u8, name: []const u8) !Archive {
+    const d: depot.Depot = .{ .root = depot_root };
+    const file_name = try std.fmt.allocPrint(gpa, "{s}.tar.gz", .{name});
+    defer gpa.free(file_name);
+    const path = try d.registryDir(gpa, file_name);
+    defer gpa.free(path);
+
     const gz = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024 * 1024));
     defer gpa.free(gz);
     return loadGzipped(gpa, gz);

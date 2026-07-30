@@ -78,15 +78,29 @@ pub fn digestString(gpa: Allocator, project: *const Table) Error![]u8 {
 
     if (deps_tbl) |t| {
         for (t.entries.items) |e| {
-            // A name in both tables is split out of `deps` at parse time
-            // (project.jl:237-238), so it must not be counted twice.
-            if (weak_tbl) |w| {
-                if (w.contains(e.key)) continue;
-            }
             const uuid = switch (e.value) {
                 .string => |s| s,
                 else => return error.InvalidProject,
             };
+            // The weak split intersects Dict **PAIRS**, not names
+            // (project.jl:237-238 — `intersect(deps, weakdeps)` over a
+            // Dict{String,String} compares key AND value). A name present in
+            // both tables with DIFFERENT uuids therefore stays in `deps`.
+            //
+            // Filtering by name alone drops such a dep from the digest
+            // entirely. Every real project is unaffected because the uuids
+            // match, which is exactly why this sat undetected: the landmark
+            // test reproduces 5e05dae… correctly either way. Found by
+            // differential review, not by the test.
+            if (weak_tbl) |w| {
+                if (w.get(e.key)) |wv| {
+                    const same = switch (wv) {
+                        .string => |ws| std.mem.eql(u8, ws, uuid),
+                        else => false,
+                    };
+                    if (same) continue;
+                }
+            }
             try deps.append(gpa, .{ .name = e.key, .value = uuid });
         }
     }
@@ -110,8 +124,21 @@ pub fn digestString(gpa: Allocator, project: *const Table) Error![]u8 {
         for (compats.items) |c| if (c.owned) gpa.free(@constCast(c.value));
         compats.deinit(gpa);
     }
-    for ([_][]const Pair{ deps.items, weak.items }) |group| {
+    // Keyed on `merge(deps, weakdeps)` — a Dict, so ONE entry per name. A name
+    // present in both tables (with different uuids, which the pair-wise split
+    // above now preserves in `deps`) must still yield a single compat line.
+    for ([_][]const Pair{ deps.items, weak.items }, 0..) |group, gi| {
         for (group) |d| {
+            if (gi == 1) {
+                var dup = false;
+                for (deps.items) |x| {
+                    if (std.mem.eql(u8, x.name, d.name)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+            }
             const raw: ?[]const u8 = if (compat_tbl) |c| blk: {
                 const v = c.get(d.name) orelse break :blk null;
                 break :blk switch (v) {
@@ -270,4 +297,42 @@ test "a project with neither name nor uuid omits the self entry" {
     const str = try digestString(testing.allocator, doc.root);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("A=00000000-0000-0000-0000-000000000001\n\n\nA=*\n", str);
+}
+
+test "a name in deps AND weakdeps with different uuids stays in deps" {
+    // The weak split intersects Dict PAIRS, not names (project.jl:237-238), so
+    // this dep must survive in block 1 while its weak twin appears in block 2 —
+    // and `compats` must still list the name ONCE, being keyed on
+    // merge(deps, weakdeps).
+    //
+    // Oracle: Pkg.Types.workspace_resolve_hash on this exact project returns
+    // d82eaeea19c6e242ff8ff747bd6dd5f073e548b9. Filtering the split by name
+    // instead yields c2eeaebf…, and emitting a duplicate compat line yields a
+    // third value again. Neither is visible in the Open-Reality landmark,
+    // because every real project's uuids agree across the two tables.
+    var doc = try parseToml(testing.allocator,
+        \\name = "Demo"
+        \\uuid = "11111111-1111-1111-1111-111111111111"
+        \\
+        \\[deps]
+        \\A = "00000000-0000-0000-0000-0000000000aa"
+        \\
+        \\[weakdeps]
+        \\A = "00000000-0000-0000-0000-0000000000bb"
+        \\
+    , null);
+    defer doc.deinit();
+
+    const str = try digestString(testing.allocator, doc.root);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings(
+        "A=00000000-0000-0000-0000-0000000000aa\n" ++
+            "Demo=11111111-1111-1111-1111-111111111111\n\n" ++
+            "A=00000000-0000-0000-0000-0000000000bb\n\n" ++
+            "A=*\nDemo=*\n",
+        str,
+    );
+
+    const got = try compute(testing.allocator, doc.root);
+    try testing.expectEqualStrings("d82eaeea19c6e242ff8ff747bd6dd5f073e548b9", &got);
 }

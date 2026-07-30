@@ -1,8 +1,9 @@
-//! Platform matching and artifact selection.
+//! Platform construction, matching and artifact selection.
 //!
 //! Port of the parts of `base/binaryplatforms.jl` that artifact installation
-//! needs: `platforms_match` (:1020-1051), `select_platform` (:1079-1110),
-//! `triplet` (:514-544), and the `compare_version_cap` strategy (:300-317).
+//! needs: the `Platform` **constructor** (:44-107), `platforms_match`
+//! (:1020-1051), `select_platform` (:1079-1110), `triplet` (:514-544), and the
+//! `compare_version_cap` strategy (:300-317).
 //!
 //! A `Platform` here is just an ordered set of string tags. That is exactly
 //! what Julia's is, and it matters: `unpack_platform`
@@ -11,7 +12,15 @@
 //! `os`, `arch` and `git-tree-sha1` before re-adding os/arch positionally. So
 //! artifact platforms carry arbitrary extra tags, and matching has to cope.
 //!
-//! Two rules carry all the subtlety:
+//! **Every `Platform` must be built by `construct`** (or `constructHost`).
+//! Julia has no other way to make one, and the constructor is not a formality:
+//! it rewrites tags in ways that change which artifact wins (see `construct`'s
+//! doc comment). A hand-assembled tag list is a platform Julia would never
+//! produce, and it diverges silently — the failure surfaces as the wrong
+//! tarball installed, not as an error. The only tag lists built by hand are in
+//! this file's own tests, where bypassing the rule IS the thing under test.
+//!
+//! Three rules carry all the subtlety:
 //!
 //!  1. **A key present on only one side is SKIPPED, not a mismatch**
 //!     (:1026-1028). An artifact built without a `libc` tag matches a host
@@ -23,6 +32,12 @@
 //!     libstdcxx 3.4.26 runs on a host capping at 3.4.30, but not the reverse.
 //!     When *both* sides declare the cap strategy it degrades to equality
 //!     (:305-307).
+//!  3. **`julia_version` compares MAJOR AND MINOR ONLY** (:101-105). That
+//!     strategy is attached by the constructor, to any platform carrying the
+//!     tag, host or not — so whenever the key is compared at all both sides
+//!     have it and both request the strategy. Verified against Julia: an
+//!     artifact tagged `1.12.0` matches a host on `1.12.6`, and `1.11.0` does
+//!     not.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -40,16 +55,225 @@ pub const Platform = struct {
     is_host: bool = false,
 
     pub fn get(self: Platform, key: []const u8) ?[]const u8 {
-        for (self.tags) |t| {
-            if (std.mem.eql(u8, t.key, key)) return t.value;
-        }
-        return null;
+        return if (findTag(self.tags, key)) |i| self.tags[i].value else null;
     }
 
     pub fn has(self: Platform, key: []const u8) bool {
         return self.get(key) != null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// The Platform constructor (binaryplatforms.jl:44-107)
+// ---------------------------------------------------------------------------
+
+pub const ConstructError = error{
+    /// `add_tag!` rejects the key or the value (`binaryplatforms.jl:126-142`).
+    /// Julia throws `ArgumentError`.
+    InvalidTagCharacter,
+    /// A tag whose key lowercases to `arch`/`os` (`:57-60`). Julia throws
+    /// `ArgumentError("Cannot double-pass key ...")`.
+    DoublePassedKey,
+} || Allocator.Error;
+
+/// `Platform(arch, os, tags)` (`binaryplatforms.jl:44-107`).
+///
+/// This lives here, with the type, because the normalisation it performs is
+/// **observable in artifact selection** and must not be reinvented by callers:
+///
+///   * a linux platform with no `libc` GAINS `libc = glibc` (:87-90);
+///   * a 32-bit-ARM linux platform with no `call_abi` GAINS
+///     `call_abi = eabihf` (:91-94);
+///   * `arch` is alias-folded by `CPUID.normalize_arch` (`base/cpuid.jl:81-97`)
+///     and `os`, every tag key and every tag value are lowercased;
+///   * `libgfortran_version`/`libstdcxx_version`/`os_version` are rounded
+///     through `VersionNumber`, so `"10.11"` becomes `"10.11.0"` (:68-77).
+///
+/// The gained tags are the sharp edge. `match_loss` (:1090-1094) counts the
+/// symmetric difference of the two tag KEY SETS, so a tag that appears out of
+/// nowhere changes the ranking and therefore which variant is installed. Six
+/// entries in the 83-file depot corpus gain a `call_abi` this way, and the
+/// `auto_libc`/`auto_call_abi` fixtures in `artifacts_model.sh` pin the flip in
+/// both directions.
+///
+/// `extra` is the raw tag list in source order, keys and values exactly as
+/// written; `construct` owns all the folding. Julia's `tags` is a `Dict`, so a
+/// later tag REPLACES an earlier one that lowercases to the same key rather
+/// than adding a second entry — that is what keeps `match_loss` counting
+/// distinct keys. (Which of two case-variant spellings wins is Julia hash
+/// order, i.e. arbitrary; only the resulting tag COUNT is well defined, and
+/// that is the part selection reads. Verified by running Julia: both insertion
+/// orders of `"Libc"`/`"libc"` yield 3 tags.)
+///
+/// Arena-lifetime: rewritten strings are allocated from `arena`; strings that
+/// need no rewriting are borrowed from `extra`.
+pub fn construct(
+    arena: Allocator,
+    raw_arch: []const u8,
+    raw_os: []const u8,
+    extra: []const Tag,
+) ConstructError!Platform {
+    const os = try lower(arena, raw_os);
+    const arch = try normalizeArch(arena, raw_arch);
+
+    var tags: std.ArrayList(Tag) = .empty;
+    // arch/os are written straight into the tag dict (:51-54), NOT through
+    // `add_tag!`, so they skip the forbidden-character check entirely.
+    try tags.append(arena, .{ .key = "arch", .value = arch });
+    try tags.append(arena, .{ .key = "os", .value = os });
+
+    for (extra) |raw| {
+        const key = try lower(arena, raw.key);
+        if (std.mem.eql(u8, key, "os") or std.mem.eql(u8, key, "arch")) {
+            return error.DoublePassedKey;
+        }
+        // Version rounding happens BEFORE `add_tag!` (:68-81), which is why a
+        // value that only rounds into a forbidden character still throws.
+        const versioned = if (isVersionTag(key)) try versionText(arena, raw.value, .full) else raw.value;
+        const value = try lower(arena, versioned);
+        if (hasForbiddenChar(key) or hasForbiddenChar(value)) return error.InvalidTagCharacter;
+        try setTag(arena, &tags, key, value);
+    }
+
+    // Auto-mapped defaults (:84-94).
+    if (std.mem.eql(u8, os, "linux")) {
+        if (findTag(tags.items, "libc") == null) {
+            try tags.append(arena, .{ .key = "libc", .value = "glibc" });
+        }
+        if ((std.mem.eql(u8, arch, "armv7l") or std.mem.eql(u8, arch, "armv6l")) and
+            findTag(tags.items, "call_abi") == null)
+        {
+            try tags.append(arena, .{ .key = "call_abi", .value = "eabihf" });
+        }
+    }
+
+    return .{ .tags = try tags.toOwnedSlice(arena), .is_host = false };
+}
+
+/// `HostPlatform(Platform(arch, os, tags))`: `construct` plus the one thing
+/// `HostPlatform(p)` does, which is to make `os_version`/`libstdcxx_version`
+/// compare as caps (:330-338).
+///
+/// Exists so no caller has to remember the second step. Forgetting it fails
+/// SILENTLY -- the cap comparisons quietly degrade to equality and artifacts
+/// built against an older libstdcxx stop matching.
+pub fn constructHost(
+    arena: Allocator,
+    raw_arch: []const u8,
+    raw_os: []const u8,
+    extra: []const Tag,
+) ConstructError!Platform {
+    var p = try construct(arena, raw_arch, raw_os, extra);
+    p.is_host = true;
+    return p;
+}
+
+/// `Dict` assignment: replace in place, or append. Replacing in place rather
+/// than moving the key to the end keeps `triplet`'s trailing `-key+value` run
+/// in source order, which is the only order any caller can rely on (Julia's is
+/// hash order).
+fn setTag(arena: Allocator, tags: *std.ArrayList(Tag), key: []const u8, value: []const u8) Allocator.Error!void {
+    if (findTag(tags.items, key)) |i| {
+        tags.items[i].value = value;
+        return;
+    }
+    try tags.append(arena, .{ .key = key, .value = value });
+}
+
+fn findTag(tags: []const Tag, key: []const u8) ?usize {
+    for (tags, 0..) |t, i| {
+        if (std.mem.eql(u8, t.key, key)) return i;
+    }
+    return null;
+}
+
+fn isVersionTag(key: []const u8) bool {
+    return std.mem.eql(u8, key, "libgfortran_version") or
+        std.mem.eql(u8, key, "libstdcxx_version") or
+        std.mem.eql(u8, key, "os_version");
+}
+
+/// `add_tag!`'s rejected set (`binaryplatforms.jl:126`): `+- /<>:"'\|?*`.
+fn hasForbiddenChar(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "+- /<>:\"'\\|?*") != null;
+}
+
+/// Borrows `s` when it is already lowercase. That is the common case (every
+/// BinaryBuilder-emitted tag), and it keeps the arena free of copies of strings
+/// the TOML document already owns.
+fn lower(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    for (s) |c| {
+        if (std.ascii.isUpper(c)) return std.ascii.allocLowerString(arena, s);
+    }
+    return s;
+}
+
+/// `CPUID.normalize_arch` (`base/cpuid.jl:81-97`). Every alias below was read
+/// back out of a real `Platform` built by Julia 1.12.6.
+fn normalizeArch(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    const a = try lower(arena, raw);
+    const aliases = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "amd64", .to = "x86_64" },
+        .{ .from = "i386", .to = "i686" },
+        .{ .from = "i486", .to = "i686" },
+        .{ .from = "i586", .to = "i686" },
+        .{ .from = "armv6", .to = "armv6l" },
+        .{ .from = "arm", .to = "armv7l" },
+        .{ .from = "armv7", .to = "armv7l" },
+        .{ .from = "armv8", .to = "armv7l" },
+        .{ .from = "armv8l", .to = "armv7l" },
+        .{ .from = "arm64", .to = "aarch64" },
+        .{ .from = "ppc64le", .to = "powerpc64le" },
+    };
+    for (aliases) |al| {
+        if (std.mem.eql(u8, a, al.from)) return al.to;
+    }
+    return a;
+}
+
+/// How `versionText` renders a parsed version.
+const VersionForm = enum {
+    /// `string(v)` -- what the constructor stores for a version tag.
+    full,
+    /// `string(VersionNumber(v.major, v.minor, v.patch))` -- drops prerelease
+    /// and build metadata, which is what `host_triplet()` does to `VERSION`
+    /// before appending it as a `julia_version` tag (:982-983).
+    release_only,
+};
+
+/// `tryparse(VersionNumber, v)` then `string(v)` (`:70-77`). A value that does
+/// not parse is passed through UNCHANGED -- Julia deliberately tolerates it
+/// ("in our effort to be extremely compatible"), and for `release_only` that
+/// keeps a caller-supplied oddity visible instead of collapsing it to `0.0.0`.
+///
+/// `version.zig`'s parser is not byte-for-byte Julia's `VERSION_REGEX`
+/// (`version.jl:111-121`): it does not enforce the `[0-9a-z-]` identifier
+/// charset, and it requires an explicit `-` before a prerelease. Only the
+/// second gap is observable, and only on a hand-written tag:
+///
+///   * `"1.2.3-01.alpha_beta"` -- Julia rejects the parse and leaves the value
+///     alone, we canonicalise it to `"1.2.3-1.alpha_beta"`. Both then hit the
+///     forbidden `-` in `add_tag!`, so BOTH reject the entry. Not observable.
+///   * `"10.11rc1"` -- Julia parses it to `"10.11.0-rc1"`, which then throws in
+///     `add_tag!` on the `-`; we leave it alone and accept the tag. **This one
+///     is a real divergence** (verified by running Julia 1.12.6), reachable
+///     only from a hand-written `Artifacts.toml`. Every BinaryBuilder-emitted
+///     `os_version`/`libstdcxx_version`/`libgfortran_version` is plain dotted
+///     decimal, which the two engines agree on exactly.
+fn versionText(arena: Allocator, s: []const u8, form: VersionForm) Allocator.Error![]const u8 {
+    const v = version_mod.parse(arena, s) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidVersion => return s,
+    };
+    return switch (form) {
+        .full => std.fmt.allocPrint(arena, "{f}", .{v}),
+        .release_only => std.fmt.allocPrint(arena, "{d}.{d}.{d}", .{ v.major, v.minor, v.patch }),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
 
 fn isCapKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "os_version") or std.mem.eql(u8, key, "libstdcxx_version");
@@ -92,6 +316,18 @@ fn compareTag(
     a_is_host: bool,
     b_is_host: bool,
 ) bool {
+    // `julia_version` compares major/minor only (:101-105). The constructor
+    // attaches that strategy to ANY platform carrying the tag, and
+    // `platforms_match` only reaches a key both sides have -- so by the time we
+    // are here both sides requested it and host-ness is irrelevant. Julia would
+    // throw on an unparseable value (`VersionNumber(a)`); we fall back to
+    // string equality rather than failing a whole file over one tag.
+    if (std.mem.eql(u8, key, "julia_version")) {
+        const a_jv = parseVer(av) orelse return std.mem.eql(u8, av, bv);
+        const b_jv = parseVer(bv) orelse return std.mem.eql(u8, av, bv);
+        return a_jv.major == b_jv.major and a_jv.minor == b_jv.minor;
+    }
+
     const a_cap = a_is_host and isCapKey(key);
     const b_cap = b_is_host and isCapKey(key);
     if (!a_cap and !b_cap) return std.mem.eql(u8, av, bv);
@@ -228,10 +464,20 @@ pub fn selectPlatform(gpa: Allocator, candidates: []const Platform, host: Platfo
 ///      counts down from `max_minor_version = 30` (:895) and returns the first
 ///      hit, so a library exporting 3.4.33 still reports 3.4.30. Verified on a
 ///      real install whose libstdc++ exports up to 3.4.33.
-///   3. The Julia version, appended as a `julia_version` tag.
+///   3. The Julia version, appended as a `julia_version` tag -- **truncated to
+///      `major.minor.patch`**, because `host_triplet()` appends
+///      `VersionNumber(VERSION.major, VERSION.minor, VERSION.patch)` (:982-983)
+///      rather than `VERSION` itself. On a release that is a no-op; on a
+///      nightly (`1.13.0-DEV.1234`) it is the difference between a working host
+///      and an `ArgumentError`, since `add_tag!` rejects the `-`.
 ///
 /// Reading the ELF's version strings rather than `dlopen`+`dlsym` keeps this a
 /// pure file read and avoids loading a foreign libstdc++ into our address space.
+///
+/// The collected tags then go through `construct`, exactly as Julia's
+/// `HostPlatform()` runs `parse(Platform, host_triplet())` (:996-998) -- so the
+/// host is normalised by the same rule as every artifact platform, and only
+/// then marked `is_host` (which is all `HostPlatform(p)` does, :330-338).
 pub const HostOptions = struct {
     /// Directory containing `share/julia` and `lib/julia`.
     julia_prefix: []const u8,
@@ -241,13 +487,14 @@ pub const HostOptions = struct {
     max_libstdcxx_minor: u32 = 30,
 };
 
-pub const DetectError = error{BuildTripletNotFound} || Allocator.Error;
+pub const DetectError = error{BuildTripletNotFound} || ConstructError;
 
 /// All allocations have the returned Platform's lifetime and are never freed
 /// individually, so `arena` must be an arena-like allocator that the caller
 /// drops wholesale. Passing a general-purpose allocator here leaks by design.
 pub fn detectHost(arena: Allocator, io: std.Io, opts: HostOptions) DetectError!Platform {
     const gpa = arena;
+    // Everything but arch/os: `construct` takes those positionally.
     var tags: std.ArrayList(Tag) = .empty;
     errdefer tags.deinit(gpa);
 
@@ -266,7 +513,7 @@ pub fn detectHost(arena: Allocator, io: std.Io, opts: HostOptions) DetectError!P
     const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.BuildTripletNotFound;
     const build_triplet = rest[0..end];
 
-    try parseBuildTriplet(gpa, build_triplet, &tags);
+    const target = try parseBuildTriplet(gpa, build_triplet, &tags);
 
     // 2. libstdc++
     const libpath = std.fmt.bufPrint(&path_buf, "{s}/lib/julia/libstdc++.so.6", .{opts.julia_prefix}) catch null;
@@ -280,10 +527,13 @@ pub fn detectHost(arena: Allocator, io: std.Io, opts: HostOptions) DetectError!P
         } else |_| {}
     }
 
-    // 3. julia_version
-    try tags.append(gpa, .{ .key = "julia_version", .value = try gpa.dupe(u8, opts.julia_version) });
+    // 3. julia_version, minus any prerelease/build metadata (:982-983).
+    try tags.append(gpa, .{
+        .key = "julia_version",
+        .value = try versionText(gpa, opts.julia_version, .release_only),
+    });
 
-    return .{ .tags = try tags.toOwnedSlice(gpa), .is_host = true };
+    return constructHost(arena, target.arch, target.os, tags.items);
 }
 
 /// Highest N in `GLIBCXX_3.4.N` present in `bytes`, capped at `max_minor`.
@@ -304,46 +554,63 @@ fn highestGlibcxx(bytes: []const u8, max_minor: u32) ?u32 {
     return best;
 }
 
-/// Parses the canonical `BUILD_TRIPLET` shape into tags.
+/// Splits the canonical `BUILD_TRIPLET` shape into `arch`, `os` and the
+/// remaining tags. The three are handed to `construct` separately because that
+/// is the constructor's signature -- and because routing arch/os through it is
+/// what applies `normalize_arch` and the auto-mapped `libc`/`call_abi`.
 ///
 /// This handles the machine-generated forms Julia actually ships
 /// (`x86_64-linux-gnu-libgfortran5-cxx11`, `aarch64-apple-darwin20`,
 /// `x86_64-w64-mingw32-libgfortran5-cxx11`, ...) rather than reimplementing
 /// Julia's full `parse(Platform, ::String)` regex, which also accepts hand
 /// written triplets Ajt never has to read here.
-fn parseBuildTriplet(gpa: Allocator, triplet_str: []const u8, tags: *std.ArrayList(Tag)) Allocator.Error!void {
+fn parseBuildTriplet(
+    gpa: Allocator,
+    triplet_str: []const u8,
+    tags: *std.ArrayList(Tag),
+) Allocator.Error!struct { arch: []const u8, os: []const u8 } {
     var it = std.mem.splitScalar(u8, triplet_str, '-');
-    const arch = it.next() orelse return;
-    try tags.append(gpa, .{ .key = "arch", .value = try gpa.dupe(u8, arch) });
+    // `splitScalar` always yields at least one element, so the arch is never
+    // missing -- an empty BUILD_TRIPLET yields an empty arch, which `construct`
+    // then carries through as-is.
+    //
+    // The dupe is load-bearing: `triplet_str` borrows the `build_h.jl` buffer
+    // that `detectHost` frees on return, and an already-lowercase arch is
+    // handed straight back out by `lower`, so without a copy the returned
+    // Platform points at freed memory. (Caught by `select_artifact.sh`, which
+    // printed `arch=` followed by garbage.) `os` needs no copy -- it is always
+    // one of the string literals below.
+    const arch = try gpa.dupe(u8, it.next().?);
+    var os: []const u8 = "unknown";
 
     var os_set = false;
     var libc: ?[]const u8 = null;
     while (it.next()) |part| {
         if (!os_set) {
             if (std.mem.eql(u8, part, "linux")) {
-                try tags.append(gpa, .{ .key = "os", .value = "linux" });
+                os = "linux";
                 os_set = true;
                 continue;
             }
             if (std.mem.eql(u8, part, "apple")) continue; // next part is darwinNN
             if (std.mem.startsWith(u8, part, "darwin")) {
-                try tags.append(gpa, .{ .key = "os", .value = "macos" });
+                os = "macos";
                 os_set = true;
                 continue;
             }
             if (std.mem.eql(u8, part, "w64")) continue; // next part is mingw32
             if (std.mem.eql(u8, part, "mingw32")) {
-                try tags.append(gpa, .{ .key = "os", .value = "windows" });
+                os = "windows";
                 os_set = true;
                 continue;
             }
             if (std.mem.startsWith(u8, part, "freebsd")) {
-                try tags.append(gpa, .{ .key = "os", .value = "freebsd" });
+                os = "freebsd";
                 os_set = true;
                 continue;
             }
             if (std.mem.startsWith(u8, part, "openbsd")) {
-                try tags.append(gpa, .{ .key = "os", .value = "openbsd" });
+                os = "openbsd";
                 os_set = true;
                 continue;
             }
@@ -362,7 +629,9 @@ fn parseBuildTriplet(gpa: Allocator, triplet_str: []const u8, tags: *std.ArrayLi
             try tags.append(gpa, .{ .key = "cxxstring_abi", .value = try gpa.dupe(u8, part) });
         }
     }
+    // Left implicit on a `-gnu`-less linux triplet: `construct` supplies glibc.
     if (libc) |lc| try tags.append(gpa, .{ .key = "libc", .value = lc });
+    return .{ .arch = arch, .os = os };
 }
 
 // ---------------------------------------------------------------------------
@@ -521,20 +790,18 @@ test "GLIBCXX scan takes the highest version at or below the cap" {
     try testing.expectEqual(@as(?u32, null), highestGlibcxx("nothing here", 30));
 }
 
-test "BUILD_TRIPLET parses into the tags Julia reports" {
-    const gpa = testing.allocator;
+/// `parseBuildTriplet` + `construct`, i.e. exactly what `detectHost` does with
+/// a BUILD_TRIPLET once the file has been read. Arena-only, like the real path.
+fn hostFromTriplet(arena: Allocator, triplet_str: []const u8) !Platform {
     var tags: std.ArrayList(Tag) = .empty;
-    defer {
-        for (tags.items) |t| {
-            // Only heap-allocated values need freeing; the static ones don't.
-            if (std.mem.eql(u8, t.key, "arch") or
-                std.mem.eql(u8, t.key, "libgfortran_version") or
-                std.mem.eql(u8, t.key, "cxxstring_abi")) gpa.free(@constCast(t.value));
-        }
-        tags.deinit(gpa);
-    }
-    try parseBuildTriplet(gpa, "x86_64-linux-gnu-libgfortran5-cxx11", &tags);
-    const p: Platform = .{ .tags = tags.items };
+    const target = try parseBuildTriplet(arena, triplet_str, &tags);
+    return constructHost(arena, target.arch, target.os, tags.items);
+}
+
+test "BUILD_TRIPLET parses into the tags Julia reports" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const p = try hostFromTriplet(a.allocator(), "x86_64-linux-gnu-libgfortran5-cxx11");
     try testing.expectEqualStrings("x86_64", p.get("arch").?);
     try testing.expectEqualStrings("linux", p.get("os").?);
     try testing.expectEqualStrings("glibc", p.get("libc").?);
@@ -543,37 +810,192 @@ test "BUILD_TRIPLET parses into the tags Julia reports" {
 }
 
 test "BUILD_TRIPLET: macos and windows shapes" {
-    const gpa = testing.allocator;
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
     inline for (.{
         .{ "aarch64-apple-darwin20", "aarch64", "macos" },
         .{ "x86_64-w64-mingw32-libgfortran5-cxx11", "x86_64", "windows" },
-        .{ "x86_64-linux-musl-libgfortran5-cxx11", "x86_64", "linux" },
     }) |c| {
-        var tags: std.ArrayList(Tag) = .empty;
-        defer {
-            for (tags.items) |t| {
-                if (std.mem.eql(u8, t.key, "arch") or
-                    std.mem.eql(u8, t.key, "libgfortran_version") or
-                    std.mem.eql(u8, t.key, "cxxstring_abi")) gpa.free(@constCast(t.value));
-            }
-            tags.deinit(gpa);
-        }
-        try parseBuildTriplet(gpa, c[0], &tags);
-        const p: Platform = .{ .tags = tags.items };
+        const p = try hostFromTriplet(a.allocator(), c[0]);
         try testing.expectEqualStrings(c[1], p.get("arch").?);
         try testing.expectEqualStrings(c[2], p.get("os").?);
     }
-    // musl must not be mistaken for glibc.
-    var tags: std.ArrayList(Tag) = .empty;
-    defer {
-        for (tags.items) |t| {
-            if (std.mem.eql(u8, t.key, "arch") or
-                std.mem.eql(u8, t.key, "libgfortran_version") or
-                std.mem.eql(u8, t.key, "cxxstring_abi")) gpa.free(@constCast(t.value));
-        }
-        tags.deinit(gpa);
+    // musl must not be mistaken for glibc, i.e. the auto-mapped default must
+    // not fire when the triplet already named a libc.
+    const musl = try hostFromTriplet(a.allocator(), "x86_64-linux-musl-libgfortran5-cxx11");
+    try testing.expectEqualStrings("x86_64", musl.get("arch").?);
+    try testing.expectEqualStrings("linux", musl.get("os").?);
+    try testing.expectEqualStrings("musl", musl.get("libc").?);
+    // ...and a linux triplet with no libc field gets glibc from `construct`.
+    const bare = try hostFromTriplet(a.allocator(), "armv7l-linux");
+    try testing.expectEqualStrings("glibc", bare.get("libc").?);
+    try testing.expectEqualStrings("eabihf", bare.get("call_abi").?);
+}
+
+test "the host's julia_version drops prerelease metadata" {
+    // `host_triplet()` appends VersionNumber(major, minor, patch) (:982-983),
+    // never VERSION itself. Keeping the `-DEV` would make `add_tag!` throw in
+    // Julia, so a nightly must not produce a tag Julia cannot.
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try testing.expectEqualStrings("1.13.0", try versionText(arena, "1.13.0-DEV.1234", .release_only));
+    try testing.expectEqualStrings("1.12.6", try versionText(arena, "1.12.6", .release_only));
+    // Unparseable input survives verbatim rather than collapsing to 0.0.0.
+    try testing.expectEqualStrings("not-a-version", try versionText(arena, "not-a-version", .release_only));
+}
+
+// --- the constructor -------------------------------------------------------
+//
+// Every expectation below was produced by RUNNING Julia 1.12.6
+// (`Platform(arch, os, Dict{String,Any}(...))` then reading `tags(p)` back).
+
+test "construct: linux gains glibc, 32-bit ARM gains eabihf" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const arm = try construct(arena, "armv7l", "linux", &.{});
+    try testing.expectEqualStrings("glibc", arm.get("libc").?);
+    try testing.expectEqualStrings("eabihf", arm.get("call_abi").?);
+    try testing.expectEqual(@as(usize, 4), arm.tags.len);
+
+    const arm6 = try construct(arena, "armv6l", "linux", &.{});
+    try testing.expectEqualStrings("eabihf", arm6.get("call_abi").?);
+
+    // 64-bit ARM gets libc but NOT call_abi.
+    const arm64 = try construct(arena, "aarch64", "linux", &.{});
+    try testing.expectEqualStrings("glibc", arm64.get("libc").?);
+    try testing.expect(arm64.get("call_abi") == null);
+
+    // Neither default fires off linux.
+    const mac = try construct(arena, "armv7l", "macos", &.{});
+    try testing.expect(mac.get("libc") == null);
+    try testing.expect(mac.get("call_abi") == null);
+    try testing.expectEqual(@as(usize, 2), mac.tags.len);
+
+    // An explicit call_abi suppresses the default.
+    const explicit = try construct(arena, "armv7l", "linux", &.{.{ .key = "call_abi", .value = "eabi" }});
+    try testing.expectEqualStrings("eabi", explicit.get("call_abi").?);
+}
+
+test "construct: arch aliases and case folding" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    inline for (.{
+        .{ "AMD64", "x86_64" }, .{ "amd64", "x86_64" }, .{ "i386", "i686" },
+        .{ "i486", "i686" },    .{ "i586", "i686" },    .{ "ARM", "armv7l" },
+        .{ "armv6", "armv6l" }, .{ "armv7", "armv7l" }, .{ "armv8", "armv7l" },
+        .{ "armv8l", "armv7l" }, .{ "arm64", "aarch64" }, .{ "ppc64le", "powerpc64le" },
+        .{ "x86_64", "x86_64" },
+    }) |c| {
+        const p = try construct(arena, c[0], "Linux", &.{});
+        try testing.expectEqualStrings(c[1], p.get("arch").?);
+        try testing.expectEqualStrings("linux", p.get("os").?);
     }
-    try parseBuildTriplet(gpa, "x86_64-linux-musl-libgfortran5-cxx11", &tags);
-    const p: Platform = .{ .tags = tags.items };
-    try testing.expectEqualStrings("musl", p.get("libc").?);
+    // Keys and values fold too.
+    const p = try construct(arena, "x86_64", "linux", &.{.{ .key = "CXXString_ABI", .value = "CXX11" }});
+    try testing.expectEqualStrings("cxx11", p.get("cxxstring_abi").?);
+}
+
+test "construct: version tags round through VersionNumber" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    inline for (.{
+        .{ "os_version", "10.11", "10.11.0" },
+        .{ "os_version", "14", "14.0.0" },
+        .{ "libstdcxx_version", "3.4", "3.4.0" },
+        .{ "libgfortran_version", "5", "5.0.0" },
+        // Julia keeps an unparseable value verbatim ("extremely compatible").
+        .{ "os_version", "notaversion", "notaversion" },
+    }) |c| {
+        const p = try construct(arena, "x86_64", "macos", &.{.{ .key = c[0], .value = c[1] }});
+        try testing.expectEqualStrings(c[2], p.get(c[0]).?);
+    }
+    // A non-version tag is NOT rounded.
+    const p = try construct(arena, "x86_64", "linux", &.{.{ .key = "cuda", .value = "10.1" }});
+    try testing.expectEqualStrings("10.1", p.get("cuda").?);
+}
+
+test "construct: rejected tags" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // A key that lowercases to os/arch is a double-pass, not a second tag --
+    // appending it would inflate the tag count and shift `match_loss`.
+    try testing.expectError(error.DoublePassedKey, construct(arena, "x86_64", "linux", &.{.{ .key = "OS", .value = "windows" }}));
+    try testing.expectError(error.DoublePassedKey, construct(arena, "x86_64", "linux", &.{.{ .key = "Arch", .value = "aarch64" }}));
+    // `add_tag!`'s forbidden characters, in the key and in the value.
+    try testing.expectError(error.InvalidTagCharacter, construct(arena, "x86_64", "linux", &.{.{ .key = "we-ird", .value = "x" }}));
+    try testing.expectError(error.InvalidTagCharacter, construct(arena, "x86_64", "linux", &.{.{ .key = "flavour", .value = "a+b" }}));
+    // arch/os themselves skip the check (they bypass `add_tag!`).
+    const p = try construct(arena, "x86_64", "linux-ish", &.{});
+    try testing.expectEqualStrings("linux-ish", p.get("os").?);
+}
+
+test "construct: a repeated key replaces rather than appends" {
+    // Julia's tag store is a Dict, and `match_loss` reads `Set(keys(...))`, so
+    // two spellings of one key must not count twice. (Which spelling's VALUE
+    // wins is Julia hash order and therefore arbitrary; the COUNT is not.)
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const p = try construct(a.allocator(), "x86_64", "linux", &.{
+        .{ .key = "Libc", .value = "musl" },
+        .{ .key = "libc", .value = "glibc" },
+    });
+    try testing.expectEqual(@as(usize, 3), p.tags.len); // arch, os, libc
+    try testing.expectEqualStrings("glibc", p.get("libc").?);
+}
+
+test "construct: normalisation changes which variant select_platform picks" {
+    // The reason this rule lives with the type and not in the caller.
+    //
+    // Oracled against Julia 1.12.6: with
+    //   host = HostPlatform(Platform("x86_64","linux"; cxxstring_abi="cxx11"))
+    //   A    = Platform("x86_64","linux"; libc="glibc")
+    //   B    = Platform("x86_64","linux"; cxxstring_abi="cxx11")
+    // Julia reports match_loss A=1, B=0 and `select_platform` returns B.
+    // B only reaches loss 0 because the constructor GAVE it `libc = glibc`.
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const host = try constructHost(arena, "x86_64", "linux", &.{.{ .key = "cxxstring_abi", .value = "cxx11" }});
+
+    const explicit_libc = try construct(arena, "x86_64", "linux", &.{.{ .key = "libc", .value = "glibc" }});
+    const gained_libc = try construct(arena, "x86_64", "linux", &.{.{ .key = "cxxstring_abi", .value = "cxx11" }});
+    try testing.expectEqual(@as(usize, 1), (try selectPlatform(arena, &.{ explicit_libc, gained_libc }, host)).?);
+
+    // The same two entries with the auto-mapping skipped: B is now one tag
+    // short, ties A on match_loss, and loses the triplet tiebreak
+    // ("x86_64-linux-gnu" > "x86_64-linux-cxx11"). A wins, i.e. the WRONG
+    // tarball -- which is precisely the bug this normalisation prevents.
+    const unnormalised = plat(&.{
+        .{ .key = "arch", .value = "x86_64" },
+        .{ .key = "os", .value = "linux" },
+        .{ .key = "cxxstring_abi", .value = "cxx11" },
+    });
+    try testing.expectEqual(@as(usize, 0), (try selectPlatform(arena, &.{ explicit_libc, unnormalised }, host)).?);
+}
+
+test "julia_version compares major and minor only" {
+    // Verified against Julia 1.12.6: 1.12.0 and 1.12.99 both match a host on
+    // 1.12.6; 1.11.0 does not. The strategy is attached by the constructor to
+    // any platform carrying the tag, so it is NOT host-conditional.
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const host = try constructHost(arena, "x86_64", "linux", &.{.{ .key = "julia_version", .value = "1.12.6" }});
+    inline for (.{ .{ "1.12.0", true }, .{ "1.12.6", true }, .{ "1.12.99", true }, .{ "1.11.0", false } }) |c| {
+        const art = try construct(arena, "x86_64", "linux", &.{.{ .key = "julia_version", .value = c[0] }});
+        try testing.expectEqual(c[1], platformsMatch(art, host));
+    }
+    // Two non-hosts use the same strategy (Julia's zero-field closures are
+    // egal, so :1035-1037 does not throw).
+    const p1 = try construct(arena, "x86_64", "linux", &.{.{ .key = "julia_version", .value = "1.12.0" }});
+    const p2 = try construct(arena, "x86_64", "linux", &.{.{ .key = "julia_version", .value = "1.12.9" }});
+    try testing.expect(platformsMatch(p1, p2));
 }

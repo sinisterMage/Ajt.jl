@@ -282,6 +282,25 @@ pub const Spec = struct {
         return .{ .ranges = r };
     }
 
+    /// The single version this spec denotes, or null if it denotes a set.
+    ///
+    /// `Pkg.pin` needs exactly this test: *"pinning a package requires a single
+    /// version, not a versionrange"* (`API.jl:487-489`, which checks
+    /// `ranges[1].lower != ranges[1].upper`). Note that the project grammar
+    /// makes `Foo@1.2` a RANGE — `[1.2.0, 2)` — so a caller that took the
+    /// lower bound of whatever it was handed would pin `Foo@1.2` to `1.2.0`
+    /// while the user was asking for something else entirely.
+    ///
+    /// Both bounds must also be fully significant (`n == 3`): `1.2 - 1.2` has
+    /// equal bounds and still spans every patch release of 1.2.
+    pub fn exact(self: Spec) ?Version {
+        if (self.ranges.len != 1) return null;
+        const r = self.ranges[0];
+        if (r.lower.n != 3 or r.upper.n != 3) return null;
+        if (!std.mem.eql(u32, &r.lower.t, &r.upper.t)) return null;
+        return .{ .major = r.lower.t[0], .minor = r.lower.t[1], .patch = r.lower.t[2] };
+    }
+
     /// The REGISTRY grammar, single range or an array of them.
     pub fn parse(gpa: Allocator, text: []const u8) (ParseError || Allocator.Error)!Spec {
         const r = try gpa.alloc(Range, 1);

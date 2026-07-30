@@ -41,6 +41,11 @@ pub const Hash = [20]u8;
 pub const Error = error{
     NotADirectory,
     ReadFailed,
+    /// A tar entry would escape the tree: a `..` component, or a path nested
+    /// under something already recorded as a symlink. Julia refuses both in
+    /// the HASHER, not just the extractor ("Refusing to extract — possible
+    /// attack!", Tar/src/extract.jl:361-368).
+    UnsafeTarPath,
 } || Allocator.Error;
 
 const Mode = enum {
@@ -298,9 +303,16 @@ const TarDir = struct {
         if (self.index.get(name)) |i| {
             return switch (self.nodes.items[i]) {
                 .dir => |*d| d,
-                // A path used as both file and directory: last one wins, as
-                // the tar is replayed in order.
-                .file => blk: {
+                .file => |f| blk: {
+                    // Nesting under a SYMLINK is an escape, and a silent one:
+                    // replacing the node with a directory hashes the symlink
+                    // away entirely, so the archive hashes to a legitimate
+                    // pinned tree while an extractor writes THROUGH the link,
+                    // outside the destination. No hash collision required.
+                    // Julia refuses this in the hasher (extract.jl:361-368).
+                    if (f.mode == .symlink) return error.UnsafeTarPath;
+                    // A plain file later used as a directory: last one wins,
+                    // as the tar is replayed in order.
                     self.nodes.items[i] = .{ .dir = .{} };
                     break :blk &self.nodes.items[i].dir;
                 },
@@ -370,6 +382,9 @@ pub fn hashTar(gpa: Allocator, tar_bytes: []const u8, skip_empty: bool) Error!Ha
         var pit = std.mem.splitScalar(u8, entry.name, '/');
         while (pit.next()) |p| {
             if (p.len == 0 or std.mem.eql(u8, p, ".")) continue;
+            // `..` walks out of the tree. std.tar resolves it; this hasher
+            // would not, so the two would disagree about what was extracted.
+            if (std.mem.eql(u8, p, "..")) return error.UnsafeTarPath;
             if (n >= parts.len) break;
             parts[n] = p;
             n += 1;
@@ -440,4 +455,54 @@ test "hashTar over a hand-built archive" {
         .{ .name = "d", .mode = .dir, .hash = dhash },
     };
     try testing.expectEqualStrings(&toHex(treeHashOfEntries(&outer)), &toHex(got));
+}
+
+test "hashTar refuses paths that escape the tree" {
+    const gpa = testing.allocator;
+    const buf = try gpa.alloc(u8, 8192);
+    defer gpa.free(buf);
+
+    // A symlink, then a file nested UNDER it. Extracting this writes through
+    // the link; hashing it naively makes the symlink vanish and yields the
+    // hash of an innocent tree. Both halves must be refused together.
+    var off: usize = 0;
+    @memset(buf, 0);
+    off = writeTarEntry(buf, off, "link", "../../outside", .sym_link);
+    off = writeTarEntry(buf, off, "link/pwned", "x", .file);
+    off += 1024;
+    try testing.expectError(error.UnsafeTarPath, hashTar(gpa, buf[0..off], false));
+
+    // A bare `..` component.
+    @memset(buf, 0);
+    off = writeTarEntry(buf, off * 0, "../escape", "x", .file);
+    off += 1024;
+    try testing.expectError(error.UnsafeTarPath, hashTar(gpa, buf[0..off], false));
+}
+
+/// Minimal ustar writer for the escape tests.
+fn writeTarEntry(buf: []u8, off_in: usize, name: []const u8, data: []const u8, kind: enum { file, sym_link }) usize {
+    var off = off_in;
+    const h = buf[off..][0..512];
+    @memset(h, 0);
+    @memcpy(h[0..name.len], name);
+    _ = std.fmt.bufPrint(h[100..][0..8], "{o:0>7}", .{@as(u32, 0o644)}) catch unreachable;
+    _ = std.fmt.bufPrint(h[108..][0..8], "{o:0>7}", .{@as(u32, 0)}) catch unreachable;
+    _ = std.fmt.bufPrint(h[116..][0..8], "{o:0>7}", .{@as(u32, 0)}) catch unreachable;
+    const size: usize = if (kind == .sym_link) 0 else data.len;
+    _ = std.fmt.bufPrint(h[124..][0..12], "{o:0>11}", .{size}) catch unreachable;
+    _ = std.fmt.bufPrint(h[136..][0..12], "{o:0>11}", .{@as(u32, 0)}) catch unreachable;
+    h[156] = if (kind == .sym_link) '2' else '0';
+    if (kind == .sym_link) @memcpy(h[157..][0..data.len], data);
+    @memcpy(h[257..][0..6], "ustar\x00");
+    @memcpy(h[263..][0..2], "00");
+    @memset(h[148..][0..8], ' ');
+    var sum: u32 = 0;
+    for (h) |b| sum += b;
+    _ = std.fmt.bufPrint(h[148..][0..7], "{o:0>6}\x00", .{sum}) catch unreachable;
+    off += 512;
+    if (kind != .sym_link) {
+        @memcpy(buf[off..][0..data.len], data);
+        off += std.mem.alignForward(usize, data.len, 512);
+    }
+    return off;
 }

@@ -1,2 +1,12 @@
 zig-out/
 .zig-cache/
+
+# Where `zig build` unpacks a fetched dependency (libgit2, under `-Dgit`).
+# ~30 MB of somebody else's C, reproducible from build.zig.zon's pinned hash.
+# `packages/ajt/` is a byte-identical mirror of the Ajt repository and this
+# must never enter it.
+zig-pkg/
+
+# The wrapper package resolves against whatever Julia is running it; a
+# committed manifest would pin a library to one machine.
+julia/Manifest.toml

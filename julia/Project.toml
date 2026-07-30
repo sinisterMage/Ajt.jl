@@ -1,0 +1,27 @@
+name = "Ajt"
+uuid = "575c97e7-7bca-49d8-beeb-2be8163ae9a8"
+version = "0.1.0"
+
+# Pkg is a dependency and always will be: this package is a *ratchet*, not a
+# fork. Everything Ajt has not implemented natively yet is forwarded to Pkg, so
+# the wrapper is never less capable than the thing it replaces — see the
+# `DELEGATED` table in src/Ajt.jl.
+[deps]
+# `gc` takes a `collect_delay::Period`, which is Pkg's own signature, so this
+# package has to be able to spell `Day(7)` and `Hour(0)`.
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+
+[compat]
+# 1.12 is a floor with teeth, not caution: `Pkg.Apps` is 1.12, the
+# `PRESERVE_*_INSTALLED` levels are 1.11, and this package re-exports all of
+# them as hard bindings — on an older Julia `using Ajt` would fail with an
+# UndefVarError instead of a version bound. The binary's Julia semantics
+# (stdlib set, version_slug, manifest format) are 1.12's as well.
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
