@@ -359,6 +359,25 @@ pub const Project = struct {
         self.dirty = true;
     }
 
+    /// Sets `entryfile` — the absolute path to the module's entry `.jl`.
+    ///
+    /// `Pkg.Apps` is the only writer of this key: `_resolve` bolts it onto the
+    /// copy of a package's project it puts in the app environment, so that
+    /// environment can load the package from the depot without a `[deps]` entry
+    /// for itself (`Apps.jl:167-171`).
+    ///
+    /// The read path takes `path` first and `entryfile` second and the write
+    /// path always emits `entryfile` (`project.jl:220-223`, `:285`), so setting
+    /// this on a project that was read from a `path` key leaves BOTH keys in
+    /// the file — `path` survives in the passthrough. That is Pkg's behaviour
+    /// and the module header covers it; it is only reachable on a project that
+    /// already had `path`, which no registered package has.
+    pub fn setEntryfile(self: *Project, new_entryfile: ?[]const u8) Allocator.Error!void {
+        if (eqlOptStr(self.entryfile, new_entryfile)) return;
+        self.entryfile = if (new_entryfile) |e| try self.arena().dupe(u8, e) else null;
+        self.dirty = true;
+    }
+
     pub fn addDep(self: *Project, name: []const u8, uuid: Uuid) Allocator.Error!void {
         // A name split into `_deps_weak` is still written into `[deps]` by the
         // merge (`project.jl:286`), so re-adding it at the same UUID changes
@@ -1770,6 +1789,60 @@ test "`path` is read as entryfile and both keys end up in the file" {
         \\name = "Foo"
         \\entryfile = "src/Other.jl"
         \\path = "src/Other.jl"
+        \\
+    , out);
+}
+
+test "setEntryfile adds the key an app environment needs" {
+    // What `ajt app add` does to the copy of a package's project it puts in
+    // `<depot>/environments/apps/<Pkg>/`: the package is loaded from the depot
+    // by path rather than resolved as a dependency of itself.
+    const src =
+        \\name = "Foo"
+        \\uuid = "11111111-2222-3333-4444-555555555555"
+        \\version = "0.1.0"
+        \\
+        \\[deps]
+        \\Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+        \\
+        \\[apps]
+        \\foo = {}
+        \\
+    ;
+    var p = try parse(testing.allocator, src, .{}, null);
+    defer p.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), p.entryfile);
+    try testing.expect(!p.dirty);
+
+    try p.setEntryfile("/depot/packages/Foo/abcd/src/Foo.jl");
+    try testing.expect(p.dirty);
+    // Idempotent: setting the same value again must not re-dirty a clean file.
+    p.dirty = false;
+    try p.setEntryfile("/depot/packages/Foo/abcd/src/Foo.jl");
+    try testing.expect(!p.dirty);
+
+    const out = try p.render(testing.allocator);
+    defer testing.allocator.free(out);
+    // `entryfile` is not in `_project_key_order`, so it sorts past every named
+    // key -- and the emitter still has to put a scalar ahead of every table,
+    // which is what makes the result valid TOML rather than an `entryfile`
+    // stranded inside `[deps]`. `[apps]` rides through the passthrough
+    // untouched: nothing here writes it, and nothing needs to.
+    //
+    // The inline `foo = {}` comes back out as a `[apps.foo]` header, which is
+    // what Julia does with the same input -- `TOML.print` over the parsed data
+    // (which is exactly what `Apps._resolve` calls, `Apps.jl:169-171`) prints
+    // an empty sub-table as a header too. Verified on 1.12.6.
+    try testing.expectEqualStrings(
+        \\name = "Foo"
+        \\uuid = "11111111-2222-3333-4444-555555555555"
+        \\version = "0.1.0"
+        \\entryfile = "/depot/packages/Foo/abcd/src/Foo.jl"
+        \\
+        \\[deps]
+        \\Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+        \\
+        \\[apps.foo]
         \\
     , out);
 }

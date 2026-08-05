@@ -26,6 +26,29 @@
 //!  3. **The compat value is the canonical `VersionSpec` rendering**, not the
 //!     string from the file: `"0.4.0"` digests as `0.4`, `"0.11, 0.12"` as
 //!     `0.11 - 0.12`.
+//!
+//! ## `[sources]` is NOT digested, and must not be
+//!
+//! The layout above covers deps, weakdeps and compat. It does not cover
+//! `[sources]`, so adding a source entry — or changing a `rev` in one — leaves
+//! this hash unchanged and `is_manifest_current` keeps answering true. That is
+//! a real defect and it is Pkg's: JuliaLang/Pkg.jl#4157, with #4351 as its
+//! monorepo-scale consequence.
+//!
+//! Digesting `[sources]` here is the obvious fix and it is the wrong one.
+//! This number is written into `Manifest.toml`, and stock Pkg compares it
+//! against its OWN computation on every operation. Widen the digest and every
+//! manifest Ajt writes looks stale to Pkg — which is precisely what
+//! `tools/diff_harness/fallback_gates.sh` gate 2 forbids — while every manifest
+//! already on disk anywhere, all carrying Pkg's hash, starts looking stale to
+//! Ajt. The fix would cost the interoperability the hash exists to provide.
+//!
+//! So the digest stays byte-exact, and the stricter answer lives in
+//! `ops/verify.zig` step 3b, which compares the project's `[sources]` against
+//! what the manifest actually recorded and is free to be stricter than Pkg
+//! because `verify` is Ajt's own verb with its own exit codes. `ops/manifest_ops.zig`
+//! — `Pkg.is_manifest_current` under Pkg's own name — deliberately does not get
+//! that check.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

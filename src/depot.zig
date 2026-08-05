@@ -368,6 +368,62 @@ pub const Depot = struct {
         return fspath.join(arena, &.{ self.root, "environments", name });
     }
 
+    /// `<depot>/environments/apps` — the environment `Pkg.Apps` keeps its
+    /// bookkeeping in (`Apps.jl:15`, `app_env_folder`).
+    ///
+    /// Two things live under it and they are not the same kind of thing: the
+    /// `AppManifest.toml` below, which records every installed app across all
+    /// packages, and one `<PkgName>/` sub-environment per `add`ed package,
+    /// which is a perfectly ordinary environment that happens to be named after
+    /// its only member. A `develop`ed package gets no sub-environment at all —
+    /// its shim loads the working tree directly (`Apps.jl:276-278`).
+    pub fn appsEnvDir(self: Depot, arena: Allocator) Allocator.Error![]u8 {
+        return fspath.join(arena, &.{ self.root, "environments", "apps" });
+    }
+
+    /// `<depot>/environments/apps/<PkgName>` — the sub-environment `app add`
+    /// builds for one package.
+    pub fn appEnvDir(self: Depot, arena: Allocator, name: []const u8) Allocator.Error![]u8 {
+        return fspath.join(arena, &.{ self.root, "environments", "apps", name });
+    }
+
+    /// `<depot>/environments/apps/AppManifest.toml` (`Apps.jl:16`).
+    ///
+    /// A normal `Manifest.toml` by format — `model/manifest.zig` reads and
+    /// writes it with no special case — whose entries carry the extra `apps`
+    /// table (`manifest.zig:208`). The name is the only thing that differs, and
+    /// `ops/verify.zig:129` already lists it among the manifest names.
+    pub fn appManifestFile(self: Depot, arena: Allocator) Allocator.Error![]u8 {
+        return fspath.join(arena, &.{ self.root, "environments", "apps", "AppManifest.toml" });
+    }
+
+    /// `<depot>/bin` — where app shims are written (`Apps.jl:17`,
+    /// `julia_bin_path`).
+    ///
+    /// The one directory in the depot that is meant to be on a user's `PATH`,
+    /// and the only one Ajt creates that Julia itself never writes to. Pkg
+    /// warns when it is absent from `PATH` (`check_apps_in_path`, `:87-111`);
+    /// so does `ops/apps.zig`.
+    pub fn binDir(self: Depot, arena: Allocator) Allocator.Error![]u8 {
+        return fspath.join(arena, &.{ self.root, "bin" });
+    }
+
+    /// `<depot>/bin/<app>` — a shim, `.bat`-suffixed on Windows.
+    ///
+    /// `target_windows` is a parameter rather than `builtin.os`: the gates
+    /// generate and compare the Windows shim from Linux, and a path builder
+    /// that could only answer for the host would make that untestable.
+    pub fn shimFile(
+        self: Depot,
+        arena: Allocator,
+        app: []const u8,
+        target_windows: bool,
+    ) Allocator.Error![]u8 {
+        if (!target_windows) return fspath.join(arena, &.{ self.root, "bin", app });
+        const name = try std.fmt.allocPrint(arena, "{s}.bat", .{app});
+        return fspath.join(arena, &.{ self.root, "bin", name });
+    }
+
     /// `<depot>/servers/<host>` (`Pkg/src/PlatformEngines.jl:46-61`).
     pub fn serverDir(self: Depot, arena: Allocator, server: []const u8) ServerHostError![]u8 {
         var buf: [max_host_len]u8 = undefined;
@@ -1337,6 +1393,23 @@ test "layout paths" {
     try testing.expectEqualStrings("/d/clones/" ++ sa_uuid, try d.cloneUuidDir(arena, uuid));
     try testing.expectEqualStrings("/d/dev", try d.devDir(arena));
     try testing.expectEqualStrings("/d/dev/StaticArrays", try d.devPackageDir(arena, "StaticArrays"));
+
+    // The apps layout. `appsEnvDir` deliberately reuses `environments/`, so a
+    // depot with an app installed has an `apps` sibling of `v1.12` -- that is
+    // Pkg's choice (`Apps.jl:15`) and not a name this module picked.
+    try testing.expectEqualStrings("/d/environments/apps", try d.appsEnvDir(arena));
+    try testing.expectEqualStrings("/d/environments/apps/Foo", try d.appEnvDir(arena, "Foo"));
+    try testing.expectEqualStrings(
+        "/d/environments/apps/AppManifest.toml",
+        try d.appManifestFile(arena),
+    );
+    try testing.expectEqualStrings("/d/bin", try d.binDir(arena));
+    try testing.expectEqualStrings("/d/bin/reverse", try d.shimFile(arena, "reverse", false));
+    try testing.expectEqualStrings("/d/bin/reverse.bat", try d.shimFile(arena, "reverse", true));
+    // App names may contain a hyphen where package names may not
+    // (`validate_app_name` vs `validate_package_name`, `Apps.jl:21-42`), so the
+    // path builder must not assume an identifier.
+    try testing.expectEqualStrings("/d/bin/my-app", try d.shimFile(arena, "my-app", false));
 }
 
 test "cloneUrlDir is the directory Pkg.gc will look for" {

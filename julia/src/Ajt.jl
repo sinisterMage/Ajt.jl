@@ -84,9 +84,8 @@ if VERSION >= v"1.11"
     )
 end
 
-# The `Apps` submodule is Pkg's, unchanged: app installation is an environment
-# plus shim generation, and the binary models neither.
-const Apps = Pkg.Apps
+# `Apps` is defined at the bottom of this file, next to `Registry` — both are
+# submodules that route through the binary, and both need `_run` to exist first.
 
 #############
 #  Offline  #
@@ -503,8 +502,8 @@ or where a behaviour is deliberately not reproduced, [`DIFFERENCES`](@ref) says
 so.
 """
 const NATIVE = Symbol[
-   Symbol("@pkg_str"), :Registry, :add, :build, :compat, :develop, :free, :gc,
-    :generate, :instantiate, :is_manifest_current, :offline, :pin, :resolve,
+   Symbol("@pkg_str"), :Apps, :Registry, :add, :build, :compat, :develop, :free,
+    :gc, :generate, :instantiate, :is_manifest_current, :offline, :pin, :resolve,
     :rm, :status, :test, :tree_hash, :up, :update, :upgrade_manifest, :verify,
     :why,
 ]
@@ -512,12 +511,12 @@ const NATIVE = Symbol[
 """
     REEXPORTED :: Vector{Symbol}
 
-Names taken from `Pkg` unchanged. These are types, enum values and the `Apps`
-submodule: a wrapper that defined its own `PackageSpec` would be a fork, not a
-drop-in — code that hands Ajt a spec built by Pkg has to keep working.
+Names taken from `Pkg` unchanged. These are types and enum values: a wrapper
+that defined its own `PackageSpec` would be a fork, not a drop-in — code that
+hands Ajt a spec built by Pkg has to keep working.
 """
 const REEXPORTED = Symbol[
-    :Apps, :PKGMODE_MANIFEST, :PKGMODE_PROJECT, :PRESERVE_ALL,
+    :PKGMODE_MANIFEST, :PKGMODE_PROJECT, :PRESERVE_ALL,
     :PRESERVE_ALL_INSTALLED, :PRESERVE_DIRECT, :PRESERVE_NONE, :PRESERVE_SEMVER,
     :PRESERVE_TIERED, :PRESERVE_TIERED_INSTALLED, :PackageMode, :PackageSpec,
     :Pkg, :PreserveLevel, :RegistrySpec, :UPLEVEL_MAJOR, :UPLEVEL_MINOR,
@@ -558,6 +557,14 @@ const DIFFERENCES = Dict{Symbol, Vector{String}}(
         "does not download or update the registry first — run `Ajt.Registry.update()`",
         "installs what it resolved and precompiles it afterwards, but never runs deps/build.jl",
         _AUTOPRECOMP_DIFFERENCE,
+    ],
+    :Apps => [
+        "`develop` from a LOCAL PATH, plus `rm` and `status`, are native; `add` and `update` delegate — both start with a registry version solve and a download, and the binary's `app` verb starts after that",
+        "`develop(name=…)`, a url, a rev or a subdir delegates: that is `handle_repo_develop!`, which clones into the depot before any app work begins",
+        "the WINDOWS `.bat` shim deliberately differs from Pkg's by one token, and it is a fix. Pkg stores `julia_cmd` pre-quoted (`generate_shim`, Apps.jl:501) and quotes it AGAIN at the call site, producing `\"\"C:\\…\\julia\"\"` — which cmd.exe cannot parse once the path contains a space, so the app does not start at all. JuliaLang/Pkg.jl#4741, still open. Ajt stores it unquoted, so the call site's quotes are the only ones. The generated file names the issue in its header",
+        "relative `[sources]` paths in a package's own Project.toml are REBASED when the project is copied into the app environment, rather than copied verbatim: Pkg 1.12.6 leaves them pointing at `<depot>/environments/apps/…`, where they do not exist, and the install dies (JuliaLang/Pkg.jl#4532, #4714 — fixed upstream after 1.12.6 by ff55f14f7, ported here). One that resolves nowhere is dropped with a warning so the dependency falls back to a registry",
+        "the app environment's own Project.toml is written in Pkg's `_project_key_order`, where `Apps._resolve` uses a bare `TOML.print` over a Dict — so the KEYS come out in a different order. Julia only ever reads that file, and `AppManifest.toml` and the POSIX shim, which are the files both tools write, are byte-identical",
+        "`status` prints an ajt report rather than Pkg's, for the same reason the environment verbs do",
     ],
     :offline => [
         "refuses network requests outright. Pkg's offline mode is advisory at the transport: only `resolve_versions!` and `update_registries` consult OFFLINE_MODE, so `Pkg.instantiate()` with JULIA_PKG_OFFLINE=1 still downloads a missing package's source and still downloads artifacts. Ajt errors instead of going to the internet",
@@ -2299,6 +2306,168 @@ function conformance(surface::Vector{Symbol} = names(Pkg.Registry))
 end
 
 end # module Registry
+
+##########
+#  Apps  #
+##########
+
+"""
+Apps installed as executables in `<depot>/bin`, from a package's `[apps]`
+section — `Pkg.Apps`.
+
+`develop`, `rm` and `status` are native. `add` and `update` delegate: both begin
+with a registry lookup and a download, and the binary's `app` verb starts after
+that (see `Ajt.DIFFERENCES[:Apps]`).
+
+One deliberate difference from `Pkg.Apps`, and it is a *fix*: the Windows `.bat`
+shim Pkg writes stores `julia_cmd` already quoted and then quotes it again at
+the call site, so the app cannot start at all when the depot path contains a
+space (JuliaLang/Pkg.jl#4741). Ajt stores it unquoted. The POSIX shim and
+`AppManifest.toml` are byte-identical to Pkg's.
+"""
+module Apps
+
+import Pkg
+import ..Ajt
+using Pkg.Types: PackageSpec
+
+public add, develop, rm, status, update
+
+const DELEGATED = Dict{Symbol, String}(
+    :add => "installing from a registry needs a version solve and a download before any app work begins; `ajt app` starts after that",
+    :update => "same as `add`: it re-resolves each app environment against the registry",
+)
+
+for name in sort!(collect(keys(DELEGATED)))
+    @eval function $name(args...; kwargs...)
+        Ajt._delegating(Symbol("Apps.", $(QuoteNode(name))), DELEGATED[$(QuoteNode(name))])
+        return Pkg.Apps.$name(args...; kwargs...)
+    end
+end
+
+# `:Apps` is the module's own name, which `names(Pkg.Apps)` returns alongside
+# its public functions — same as `:Registry` in the sibling submodule.
+const NATIVE = Symbol[:Apps, :develop, :rm, :status]
+
+"""
+    _path(pkg) -> (path, reason)
+
+The binary's `app dev` takes a local PATH. Anything else — a url, a rev, a
+registered name — is `handle_repo_develop!`'s job and delegates.
+"""
+function _path(pkg::PackageSpec)
+    pkg.path === nothing && return (nothing, "`develop` without a local path looks the source up in a registry or clones it")
+    pkg.repo.source === nothing || return (nothing, "a repository source together with a path")
+    pkg.repo.rev === nothing || return (nothing, "`develop` with a rev")
+    pkg.repo.subdir === nothing || return (nothing, "`develop` with a subdir")
+    return (String(pkg.path), nothing)
+end
+
+develop(pkg::AbstractString; kwargs...) = develop(PackageSpec(; path = String(pkg)); kwargs...)
+develop(pkgs::Vector; kwargs...) = (foreach(p -> develop(p; kwargs...), pkgs); nothing)
+
+# The keyword form `Pkg.Apps` generates at `Apps.jl:451-471`. Reproduced rather
+# than inherited: it is the spelling the docs use (`Pkg.Apps.develop(path=".")`)
+# and a wrapper that only took positionals would break every call written
+# against Pkg.
+function develop(;
+        name::Union{Nothing, AbstractString} = nothing,
+        uuid::Union{Nothing, AbstractString, Base.UUID} = nothing,
+        version = nothing, url = nothing, rev = nothing,
+        path = nothing, subdir = nothing, kwargs...,
+    )
+    return develop(PackageSpec(; name, uuid, version, url, rev, path, subdir); kwargs...)
+end
+develop(pkgs::Vector{<:NamedTuple}; kwargs...) =
+    develop([PackageSpec(; pkg...) for pkg in pkgs]; kwargs...)
+
+function develop(pkg::PackageSpec; io::IO = stdout)
+    path, reason = _path(pkg)
+    if path === nothing
+        Ajt._delegating(:var"Apps.develop", reason)
+        return Pkg.Apps.develop(pkg)
+    end
+    out, code = Ajt._run(String["app", "dev", path, "--julia", _julia()])
+    code == 0 || return Ajt._failed(io, "app dev", out, code)
+    return _render(io, out)
+end
+
+rm(name::AbstractString; kwargs...) = rm([name]; kwargs...)
+rm(pkg::PackageSpec; kwargs...) = rm([something(pkg.name, "")]; kwargs...)
+function rm(names::Vector; io::IO = stdout)
+    args = String["app", "rm"]
+    for n in names
+        push!(args, n isa PackageSpec ? String(something(n.name, "")) : String(n))
+    end
+    push!(args, "--julia")
+    push!(args, _julia())
+    out, code = Ajt._run(args)
+    code == 0 || return Ajt._failed(io, "app rm", out, code)
+    return _render(io, out)
+end
+
+status(pkg_or_app::AbstractString; kwargs...) = status([pkg_or_app]; kwargs...)
+status(pkg::PackageSpec; kwargs...) = status([something(pkg.name, "")]; kwargs...)
+function status(pkgs_or_apps::Vector = String[]; io::IO = stdout)
+    args = String["app", "status"]
+    isempty(pkgs_or_apps) || push!(args, String(first(pkgs_or_apps)))
+    push!(args, "--julia")
+    push!(args, _julia())
+    out, code = Ajt._run(args)
+    code == 0 || return Ajt._failed(io, "app status", out, code)
+    for line in eachline(IOBuffer(out))
+        f = split(line, '\t')
+        f[1] == "app" || continue
+        printstyled(io, "[", f[4][1:8], "] "; color = :light_black)
+        printstyled(io, f[2]; color = :green)
+        printstyled(io, " ", Base.contractuser(f[5]), "\n"; color = :light_black)
+    end
+    return nothing
+end
+
+"""
+`joinpath(Sys.BINDIR, "julia")` (`Apps.jl:184`) — the julia a shim will exec,
+passed explicitly rather than left to the binary's `PATH` probe.
+
+The two answers differ on a system where `PATH` reaches julia through a
+symlink: the probe resolves it, `Sys.BINDIR` is already resolved, and the string
+ends up baked into every shim and recorded in `AppManifest.toml`. Sending
+Julia's own answer is what keeps the two tools' shims byte-identical.
+"""
+_julia() = joinpath(Sys.BINDIR, "julia" * (Sys.iswindows() ? ".exe" : ""))
+
+function _render(io::IO, out::AbstractString)
+    for line in eachline(IOBuffer(out))
+        f = split(line, '\t')
+        kind = f[1]
+        if kind in ("installed", "developed", "removed", "unchanged") && length(f) >= 4
+            mark = kind == "removed" ? "-" : kind == "unchanged" ? "=" : "+"
+            Ajt._hdr(io, :Apps, "$mark $(f[2]) ($(f[3]))")
+        elseif kind == "dropped_source" && length(f) >= 3
+            @warn "Ignoring [sources] entry for $(f[2]): `$(f[3])` does not exist relative to the package"
+        elseif kind == "warning" && length(f) >= 2 && f[2] == "bin_not_on_path"
+            @warn """
+            Apps were installed but `$(joinpath(first(DEPOT_PATH), "bin"))` is not on your PATH.
+            Add it to run them by name.""" maxlog = 1
+        end
+    end
+    return nothing
+end
+
+"""
+    conformance(surface = names(Pkg.Apps))
+
+The same ratchet check as `Ajt.conformance`, for the `Apps` submodule.
+"""
+function conformance(surface::Vector{Symbol} = names(Pkg.Apps))
+    accounted = Set{Symbol}(NATIVE)
+    union!(accounted, keys(DELEGATED))
+    unaccounted = Symbol[n for n in surface if !(n in accounted)]
+    undefined = Symbol[n for n in sort!(collect(accounted)) if !isdefined(@__MODULE__, n)]
+    return (; unaccounted, undefined)
+end
+
+end # module Apps
 
 ##########
 #  REPL  #

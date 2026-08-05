@@ -26,6 +26,9 @@ pub const julia = struct {
     pub const env = @import("julia/env.zig");
     /// `Base.hash(::String)` — the number `clones/<name>` is spelled with.
     pub const string_hash = @import("julia/string_hash.zig");
+    /// `Base.shell_escape` / `Base.shell_escape_wincmd` — how an app shim
+    /// quotes the julia path and the module spec it execs.
+    pub const shell = @import("julia/shell.zig");
 
     pub const Uuid = slug.Uuid;
     pub const Sha1 = slug.Sha1;
@@ -221,6 +224,10 @@ pub const ops = struct {
     /// from the package's test target. Spelled `test_op` because `test` is a
     /// Zig keyword and `@"test"` at every call site would be worse.
     pub const test_op = @import("ops/test.zig");
+    /// `Pkg.Apps`: the apps environment, `AppManifest.toml`, and the shims in
+    /// `<depot>/bin`. Deliberately NOT bug-compatible on Windows — see the
+    /// module header for JuliaLang/Pkg.jl#4741.
+    pub const apps = @import("ops/apps.zig");
 };
 
 /// The dynamic frontier scheduler: one dependency graph over
@@ -301,6 +308,7 @@ test {
     _ = @import("julia/stdlibs.zig");
     _ = @import("julia/preferences.zig");
     _ = @import("julia/string_hash.zig");
+    _ = @import("julia/shell.zig");
     _ = @import("julia/env.zig");
     _ = @import("registry/tarball.zig");
     _ = @import("registry/index.zig");
@@ -339,6 +347,7 @@ test {
     _ = @import("ops/sandbox.zig");
     _ = @import("ops/build.zig");
     _ = @import("ops/test.zig");
+    _ = @import("ops/apps.zig");
     _ = @import("cache/jicache.zig");
     _ = @import("cache/key.zig");
     _ = @import("cache/slug.zig");

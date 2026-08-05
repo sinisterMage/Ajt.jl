@@ -103,6 +103,10 @@ const usage =
     \\                                     dependency. Exit 1 if any suite fails
     \\  ajt why [--project D] <Name>...    The dependency paths that explain why a
     \\                                     package is in the manifest
+    \\  ajt app dev <path>                 Install a package's [apps] as executables
+    \\  ajt app rm <Pkg|app>...            in <depot>/bin, pointed at the working
+    \\  ajt app status [Pkg|app]           tree. See `app options`
+
     \\  ajt generate <path>                Scaffold a package: Project.toml and
     \\                                     src/<Pkg>.jl, and nothing else
     \\  ajt compat [--project D] <Name> [spec]
@@ -142,6 +146,31 @@ const usage =
     \\                      on too, on the truthy set Base.get_bool_env accepts
     \\                      (t/true/y/yes/1 and their Capitalized/UPPERCASE
     \\                      spellings); anything else is refused, as in Pkg.
+    \\
+    \\app options:
+    \\  --depot PATH        Depot stack, in DEPOT_PATH order. The first is written
+    \\                      to (Pkg.depots1()) and the whole stack is what a shim
+    \\                      exports as JULIA_DEPOT_PATH
+    \\  --julia PATH        The julia a shim execs. Default: <bindir>/julia, which
+    \\                      is joinpath(Sys.BINDIR, "julia") as Pkg uses. Baked
+    \\                      into every shim, and recorded in AppManifest.toml
+    \\  --julia-bindir D    Sys.BINDIR, when there is no julia on PATH to probe
+    \\  --target T          posix (default) or windows: which shim dialect to
+    \\                      write. Pkg picks by Sys.iswindows() and cannot be
+    \\                      asked for the other one; the gates need both
+    \\  --dry-run           Report the changes and write nothing
+    \\
+    \\  Apps go in <depot>/bin, which has to be on your PATH -- `app dev` warns
+    \\  when it is not. `dev` builds NO app environment: the shim's
+    \\  JULIA_LOAD_PATH is the working tree, so editing the source changes the
+    \\  app with no reinstall, and `rm` will not delete a checkout it did not
+    \\  create. `app add` (from a registry) is not implemented; Ajt.Apps.add
+    \\  delegates to Pkg.
+    \\
+    \\  The Windows shim deliberately DIFFERS from Pkg's by one token: Pkg
+    \\  stores julia_cmd pre-quoted and quotes it again at the call site, which
+    \\  cmd.exe cannot parse once the path contains a space
+    \\  (JuliaLang/Pkg.jl#4741). The POSIX shim is byte-identical to Pkg's.
     \\
     \\gc options:
     \\  --depot PATH        Depot stack, in DEPOT_PATH order. Only the first is
@@ -941,6 +970,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "test")) {
         try cmdTest(gpa, arena, io, out, init.environ_map, args[2..]);
+        try out.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "app")) {
+        try cmdApp(gpa, arena, io, out, init.environ_map, args[2..]);
         try out.flush();
         return;
     }
@@ -3931,6 +3966,166 @@ fn printPrecompile(
 fn missingValue(opt: []const u8) error{MissingArgument} {
     std.debug.print("ajt: '{s}' requires a value\n", .{opt});
     return error.MissingArgument;
+}
+
+/// `ajt app {dev,rm,status}` — `Pkg.Apps` (`ops/apps.zig`).
+///
+/// `add` and `update` are not here yet: both need a registry lookup and a
+/// download before any of this module's work starts, and the wrapper delegates
+/// them (`Ajt.DIFFERENCES[:Apps]`). `dev`, `rm` and `status` need neither, and
+/// `dev` is the verb that carries the whole shim path.
+fn cmdApp(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    environ: *std.process.Environ.Map,
+    args: []const []const u8,
+) !void {
+    var depots: std.ArrayList([]const u8) = .empty;
+    defer depots.deinit(gpa);
+    var julia_bindir: ?[]const u8 = null;
+    var julia: ?[]const u8 = null;
+    var target: ?ajt.ops.apps.Target = null;
+    var dry_run = false;
+    var sub: ?[]const u8 = null;
+    var positional: std.ArrayList([]const u8) = .empty;
+    defer positional.deinit(gpa);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--depot")) {
+            i += 1;
+            if (i >= args.len) return missingValue("--depot");
+            try depots.append(gpa, args[i]);
+        } else if (std.mem.eql(u8, a, "--julia")) {
+            i += 1;
+            if (i >= args.len) return missingValue("--julia");
+            julia = args[i];
+        } else if (std.mem.eql(u8, a, "--julia-bindir")) {
+            i += 1;
+            if (i >= args.len) return missingValue("--julia-bindir");
+            julia_bindir = args[i];
+        } else if (std.mem.eql(u8, a, "--target")) {
+            // The gates render a Windows shim from Linux; nothing else has a
+            // reason to ask for a dialect that is not the host's.
+            i += 1;
+            if (i >= args.len) return missingValue("--target");
+            target = std.meta.stringToEnum(ajt.ops.apps.Target, args[i]) orelse {
+                std.debug.print("ajt app: unknown --target '{s}' (posix|windows)\n", .{args[i]});
+                return error.UnknownOption;
+            };
+        } else if (std.mem.eql(u8, a, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            std.debug.print("ajt app: unknown option '{s}'\n", .{a});
+            return error.UnknownOption;
+        } else if (sub == null) {
+            sub = a;
+        } else {
+            try positional.append(gpa, a);
+        }
+    }
+
+    const verb = sub orelse {
+        std.debug.print("ajt app: expected a subcommand (dev|rm|status)\n", .{});
+        return error.MissingArgument;
+    };
+
+    const stack = try resolveStack(arena, io, environ, depots.items, julia_bindir);
+    if (stack.entries.len == 0) {
+        std.debug.print("ajt app: no depot to install into; pass --depot\n", .{});
+        return error.NoDepot;
+    }
+
+    // `joinpath(Sys.BINDIR, "julia")` (`Apps.jl:184`), unless pinned. This is
+    // baked into every shim, so getting it from the same probe the depot came
+    // from keeps the two consistent.
+    const julia_exe = julia orelse blk: {
+        const bindir = julia_bindir orelse (try findJuliaBindir(arena, io, environ)) orelse {
+            std.debug.print(
+                "ajt app: no julia on PATH to point the shims at; pass --julia\n",
+                .{},
+            );
+            return error.MissingArgument;
+        };
+        break :blk try std.fs.path.join(arena, &.{ bindir, "julia" });
+    };
+
+    const opts: ajt.ops.apps.Options = .{
+        .stack = stack,
+        .julia = julia_exe,
+        .target = target orelse .posix,
+        .dry_run = dry_run,
+    };
+
+    if (std.mem.eql(u8, verb, "status") or std.mem.eql(u8, verb, "st")) {
+        const rows = try ajt.ops.apps.status(
+            arena,
+            io,
+            opts,
+            if (positional.items.len != 0) positional.items[0] else null,
+        );
+        for (rows) |r| {
+            var uuid_buf: [36]u8 = undefined;
+            try out.print("app\t{s}\t{s}\t{s}\t{s}\n", .{
+                r.app,
+                r.pkg,
+                ajt.model.manifest.formatUuid(r.uuid, &uuid_buf),
+                r.julia_command,
+            });
+        }
+        try out.print("apps\t{d}\n", .{rows.len});
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "dev") or std.mem.eql(u8, verb, "develop")) {
+        if (positional.items.len != 1) {
+            std.debug.print("ajt app dev: expected exactly one path\n", .{});
+            return error.MissingArgument;
+        }
+        const path = positional.items[0];
+        // A url is `handle_repo_develop!`'s job, which lives in `ops/edit.zig`
+        // against a project environment rather than the apps one. Refuse
+        // clearly rather than half-doing it; the wrapper delegates.
+        if (ajt.git.url.isUrl(path)) {
+            std.debug.print(
+                "ajt app dev: a repository url is not implemented; clone it and dev the path\n",
+                .{},
+            );
+            return error.UnknownOption;
+        }
+        const rep = try ajt.ops.apps.develop(gpa, arena, io, opts, path, environ);
+        try reportApp(out, rep);
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "remove")) {
+        if (positional.items.len == 0) {
+            std.debug.print("ajt app rm: expected a package or app name\n", .{});
+            return error.MissingArgument;
+        }
+        for (positional.items) |name| {
+            const rep = try ajt.ops.apps.remove(gpa, arena, io, opts, name);
+            try reportApp(out, rep);
+        }
+        return;
+    }
+
+    std.debug.print("ajt app: unknown subcommand '{s}' (dev|rm|status)\n", .{verb});
+    return error.UnknownCommand;
+}
+
+fn reportApp(out: *Io.Writer, rep: ajt.ops.apps.Report) !void {
+    for (rep.dropped_sources) |d| {
+        try out.print("dropped_source\t{s}\t{s}\n", .{ d.dep, d.path });
+    }
+    for (rep.changes) |c| {
+        try out.print("{t}\t{s}\t{s}\t{s}\n", .{ c.kind, c.app, c.pkg, c.shim });
+    }
+    if (rep.bin_not_on_path) try out.writeAll("warning\tbin_not_on_path\n");
+    if (rep.dry_run) try out.writeAll("dry_run\ttrue\n");
 }
 
 /// `ajt resolve` — run PubGrub over an environment.

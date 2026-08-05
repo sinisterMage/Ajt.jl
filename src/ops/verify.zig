@@ -76,6 +76,17 @@
 //!     here, where `instantiate` carries on. Both are cases where the honest
 //!     answer is "I do not know", and the caller's only use for this command is
 //!     deciding whether it may skip work.
+//!  3. **A `[sources]` url the manifest never applied is stale** (step 3b).
+//!     `workspace_resolve_hash` does not digest `[sources]` at all, so adding a
+//!     source entry or moving a `rev` changes the hash by nothing and Pkg goes
+//!     on believing the manifest current — JuliaLang/Pkg.jl#4157 and #4351.
+//!     Step 3b compares the project's `[sources]` urls against the `repo-url` /
+//!     `repo-rev` / `repo-subdir` the manifest recorded and answers `resolve`
+//!     when they disagree. Only urls: a `[sources]` PATH is overlaid onto the
+//!     entry at load time by `load_all_deps` and needs no manifest support, so
+//!     checking it would call a perfectly good Pkg-written environment stale.
+//!     The hash itself stays byte-exact — see `julia/project_hash.zig` for why
+//!     widening it would cost the interop this whole project rests on.
 //!
 //! ### `--frozen`
 //!
@@ -148,6 +159,7 @@ pub const Kind = enum {
     manifest_invalid,
     manifest_hash_absent,
     project_hash_mismatch,
+    sources_not_applied,
     direct_dep_unmanifested,
     package_missing,
     dev_path_missing,
@@ -166,7 +178,11 @@ pub const Kind = enum {
             // Content is missing from the depot. `instantiate` fixes it.
             .package_missing, .dev_path_missing, .stdlib_missing, .unresolvable_entry => .install,
             // The manifest no longer describes the project. A resolve fixes it.
-            .manifest_hash_absent, .project_hash_mismatch, .direct_dep_unmanifested => .resolve,
+            .manifest_hash_absent,
+            .project_hash_mismatch,
+            .sources_not_applied,
+            .direct_dep_unmanifested,
+            => .resolve,
             // Something is wrong with the files or the machine, and no ordinary
             // Pkg operation is the answer.
             .project_unreadable,
@@ -191,6 +207,7 @@ pub const Kind = enum {
             .manifest_invalid => "manifest is not a valid Manifest.toml",
             .manifest_hash_absent => "manifest records no project_hash",
             .project_hash_mismatch => "the project changed since the manifest was resolved",
+            .sources_not_applied => "the manifest does not reflect this [sources] entry",
             .direct_dep_unmanifested => "is a direct dependency but has no manifest entry",
             .package_missing => "not installed",
             .dev_path_missing => "developed source directory is missing",
@@ -530,6 +547,96 @@ pub fn run(arena: Allocator, scratch: Allocator, io: Io, opts: Options) Error!Re
         .current => {},
     }
 
+    // ---- 3b. [sources] is actually reflected in the manifest ---------------
+    //
+    // `project_hash` covers direct deps, weakdeps and compat and NOTHING ELSE
+    // (`workspace_resolve_hash`, `Types.jl:645-666`, ported byte-exact in
+    // `julia/project_hash.zig`). So adding a `[sources]` entry -- or changing a
+    // `rev` in one -- leaves the hash untouched, `is_manifest_current` says
+    // true, and the source is never applied to anything. That is
+    // JuliaLang/Pkg.jl#4157, with #4351 as its monorepo-scale consequence:
+    // "there's no good way to just bring things into consistency within
+    // [sources]".
+    //
+    // ## Why this is not a change to the hash
+    //
+    // Digesting `[sources]` too would be the obvious fix and it would break the
+    // one property this whole project rests on. The `project_hash` Ajt writes
+    // would stop matching the one Pkg computes, so stock `Pkg.resolve()` would
+    // find work to do after every `ajt resolve` -- which is exactly what
+    // `tools/diff_harness/fallback_gates.sh` gate 2 exists to forbid -- and
+    // every manifest already on disk anywhere carries Pkg's hash, so Ajt would
+    // declare all of them stale. The hash stays byte-exact; the STRICTER answer
+    // lives here, in a verb Ajt owns and whose exit codes are its own.
+    //
+    // `ops/manifest_ops.zig` deliberately does NOT get this check.
+    // `manifest current` is `Pkg.is_manifest_current` under Pkg's own name and
+    // has to keep agreeing with it.
+    //
+    // ## Why only a `url` source is checked
+    //
+    // A `[sources]` **path** needs no manifest support at all: `load_all_deps`
+    // overlays it onto the entry every single time the environment is loaded,
+    // clearing the tree hash as it goes (`Operations.jl:174-186`). So a
+    // manifest that records a `git-tree-sha1` and no `path`, beside a project
+    // that pins a path for the same name, is a correct and fully working
+    // environment -- Pkg loads the working tree, and so does step 4 below.
+    // Flagging it would call a Pkg-written environment stale on the strength of
+    // a field Pkg never needed to write, which is the exact false positive this
+    // check must not have. (It did, the first draft: the fixture in "a
+    // [sources] path is project-relative, not manifest-relative" is that
+    // environment, and Julia was the oracle for it.)
+    //
+    // A `url` is the opposite case. Nothing overlays it at load time: the
+    // repository has to be CLONED and its commit recorded, so `repo-url`,
+    // `repo-rev` and `git-tree-sha1` in the manifest are the only statement of
+    // which commit this environment means. Change the `rev` and the manifest
+    // still pins the old one -- #4351's "no good way to bring things into
+    // consistency" -- and `applySourceRepos` (`ops/resolve.zig:1221-1330`) is
+    // what re-derives them, so `resolve` is a remedy that genuinely works.
+    for (project.sources.items) |s| {
+        const entry = manifest.findByName(s.name) orelse continue;
+
+        if (s.url) |url| {
+            // `load_all_deps`: a `[sources]` url outranks the manifest and
+            // CLEARS the path (`Operations.jl:180-186`). A resolve reproduces
+            // all three fields through `applySourceRepos`, so if any of them
+            // disagrees the manifest predates the edit.
+            if (!eqlOpt(entry.repo_url, url)) {
+                try problems.append(arena, .{
+                    .kind = .sources_not_applied,
+                    .subject = s.name,
+                    .want = url,
+                    .got = entry.repo_url orelse "",
+                    .detail = "resolve to apply it (Pkg's project_hash does not cover [sources]: JuliaLang/Pkg.jl#4157)",
+                });
+            } else if (s.rev != null and !eqlOpt(entry.repo_rev, s.rev.?)) {
+                try problems.append(arena, .{
+                    .kind = .sources_not_applied,
+                    .subject = s.name,
+                    .want = s.rev.?,
+                    .got = entry.repo_rev orelse "",
+                    .detail = "resolve to apply the new rev (JuliaLang/Pkg.jl#4157)",
+                });
+            } else if (s.subdir != null and !eqlOpt(entry.repo_subdir, s.subdir.?)) {
+                try problems.append(arena, .{
+                    .kind = .sources_not_applied,
+                    .subject = s.name,
+                    .want = s.subdir.?,
+                    .got = entry.repo_subdir orelse "",
+                    .detail = "resolve to apply the new subdir (JuliaLang/Pkg.jl#4157)",
+                });
+            }
+            continue;
+        }
+        // A path source: nothing to check, per the comment above. Step 4
+        // already proves the directory it names exists.
+    }
+    // A `[sources]` disagreement makes every package-level answer below moot
+    // for the same reason a stale hash does: the resolve that follows may
+    // change which packages are wanted at all.
+    if (problems.items.len != 0) return try finishAll(arena, &rep, &problems);
+
     // ---- 4. every LOADABLE entry's source exists --------------------------
     if (opts.stack.entries.len == 0) return error.NoDepot;
 
@@ -770,6 +877,25 @@ fn finish(
     try problems.append(arena, p);
     rep.problems = try problems.toOwnedSlice(arena);
     return rep.*;
+}
+
+/// `finish` for a step that has already appended everything it found.
+fn finishAll(
+    arena: Allocator,
+    rep: *Report,
+    problems: *std.ArrayList(Problem),
+) Allocator.Error!Report {
+    rep.problems = try problems.toOwnedSlice(arena);
+    return rep.*;
+}
+
+/// `a == b` where `a` may be absent. An absent value never equals a present
+/// one — which is the case that matters here: a manifest entry with no
+/// `repo-url` at all is precisely the shape a `[sources]` url that was never
+/// applied leaves behind.
+fn eqlOpt(a: ?[]const u8, b: []const u8) bool {
+    const x = a orelse return false;
+    return std.mem.eql(u8, x, b);
 }
 
 /// `isdir`. Any error — missing, permission, cancellation — is "no": a
@@ -1357,6 +1483,153 @@ test "a tree hash outranks a manifest path, as source_path does" {
     try testing.expect(!rep.ok());
     try testing.expectEqual(Kind.package_missing, firstProblem(rep).?.kind);
     try testing.expectEqual(@as(usize, 0), rep.developed);
+}
+
+/// An environment whose `[sources]` names a git url, with the manifest fields
+/// that url resolved to supplied by the caller. `repo` of `null` is the
+/// "never applied" shape a plain registry resolve leaves behind.
+fn writeUrlSourceEnv(
+    f: *Fixture,
+    source_toml: []const u8,
+    repo: ?struct { url: []const u8, rev: ?[]const u8 = null, subdir: ?[]const u8 = null },
+) ![]const u8 {
+    const a = f.arena();
+    const project = try std.fmt.allocPrint(a,
+        \\name = "Fixture"
+        \\uuid = "11111111-2222-3333-4444-555555555555"
+        \\version = "0.1.0"
+        \\
+        \\[deps]
+        \\StaticArrays = "{s}"
+        \\LinearAlgebra = "{s}"
+        \\
+        \\[sources]
+        \\{s}
+        \\
+    , .{ Fixture.pkg_uuid, Fixture.std_uuid, source_toml });
+    try f.write("env/Project.toml", project);
+
+    const pdoc = try @import("../toml/parse.zig").parse(a, project, null);
+    const hash = try project_hash.compute(a, pdoc.root);
+
+    var repo_lines: std.ArrayList(u8) = .empty;
+    if (repo) |r| {
+        try repo_lines.appendSlice(a, try std.fmt.allocPrint(a, "repo-url = \"{s}\"\n", .{r.url}));
+        if (r.rev) |v| try repo_lines.appendSlice(a, try std.fmt.allocPrint(a, "repo-rev = \"{s}\"\n", .{v}));
+        if (r.subdir) |v| try repo_lines.appendSlice(a, try std.fmt.allocPrint(a, "repo-subdir = \"{s}\"\n", .{v}));
+    }
+
+    try f.write("env/Manifest.toml", try std.fmt.allocPrint(a,
+        \\julia_version = "1.12.6"
+        \\manifest_format = "2.0"
+        \\project_hash = "{s}"
+        \\
+        \\[[deps.StaticArrays]]
+        \\git-tree-sha1 = "{s}"
+        \\uuid = "{s}"
+        \\version = "1.9.13"
+        \\{s}
+        \\[[deps.LinearAlgebra]]
+        \\uuid = "{s}"
+        \\
+    , .{ &hash, Fixture.pkg_tree, Fixture.pkg_uuid, repo_lines.items, Fixture.std_uuid }));
+    return try f.join(&.{"env"});
+}
+
+test "a [sources] url the manifest never applied is stale, though project_hash is current" {
+    // JuliaLang/Pkg.jl#4157. `workspace_resolve_hash` covers deps, weakdeps and
+    // compat -- so adding this `[sources]` entry changed the hash by NOTHING,
+    // `Pkg.is_manifest_current` still answers true, and the repository is never
+    // cloned. `ajt verify` has to notice, and its remedy has to be `resolve`.
+    var buf: [512]u8 = undefined;
+    var f = try Fixture.init(&buf);
+    defer f.deinit();
+
+    const env = try writeUrlSourceEnv(
+        &f,
+        \\StaticArrays = {url = "https://github.com/JuliaArrays/StaticArrays.jl", rev = "master"}
+    ,
+        null,
+    );
+    const prefix = try f.installStdlibs();
+
+    const rep = try run(f.arena(), testing.allocator, testing.io, .{
+        .env_path = env,
+        .stack = try f.stack(),
+        .julia_prefix = prefix,
+    });
+
+    // Non-vacuity: the hash itself is CURRENT. Were it stale, step 3 would have
+    // returned first and this test would prove nothing about step 3b.
+    for (rep.problems) |p| try testing.expect(p.kind != .project_hash_mismatch);
+
+    try testing.expect(!rep.ok());
+    try testing.expectEqual(@as(usize, 1), rep.problems.len);
+    try testing.expectEqual(Kind.sources_not_applied, rep.problems[0].kind);
+    try testing.expectEqualStrings("StaticArrays", rep.problems[0].subject);
+    try testing.expectEqual(Remedy.resolve, rep.remedy().?);
+}
+
+test "a [sources] url whose rev moved is stale; one the manifest matches is not" {
+    var buf: [512]u8 = undefined;
+    var f = try Fixture.init(&buf);
+    defer f.deinit();
+    const prefix = try f.installStdlibs();
+
+    const url = "https://github.com/JuliaArrays/StaticArrays.jl";
+
+    // Applied and in agreement: nothing to report.
+    {
+        const env = try writeUrlSourceEnv(
+            &f,
+            \\StaticArrays = {url = "https://github.com/JuliaArrays/StaticArrays.jl", rev = "master"}
+        ,
+            .{ .url = url, .rev = "master" },
+        );
+        const rep = try run(f.arena(), testing.allocator, testing.io, .{
+            .env_path = env,
+            .stack = try f.stack(),
+            .julia_prefix = prefix,
+        });
+        for (rep.problems) |p| try testing.expect(p.kind != .sources_not_applied);
+    }
+
+    // The rev moved. `git-tree-sha1` still pins the old commit and no hash
+    // changed -- #4351's monorepo complaint, in one environment.
+    {
+        const env = try writeUrlSourceEnv(
+            &f,
+            \\StaticArrays = {url = "https://github.com/JuliaArrays/StaticArrays.jl", rev = "v1.9.13"}
+        ,
+            .{ .url = url, .rev = "master" },
+        );
+        const rep = try run(f.arena(), testing.allocator, testing.io, .{
+            .env_path = env,
+            .stack = try f.stack(),
+            .julia_prefix = prefix,
+        });
+        try testing.expectEqual(@as(usize, 1), rep.problems.len);
+        try testing.expectEqual(Kind.sources_not_applied, rep.problems[0].kind);
+        try testing.expectEqualStrings("v1.9.13", rep.problems[0].want);
+        try testing.expectEqualStrings("master", rep.problems[0].got);
+    }
+
+    // A subdir that moved is the same class of staleness.
+    {
+        const env = try writeUrlSourceEnv(
+            &f,
+            \\StaticArrays = {url = "https://github.com/JuliaArrays/StaticArrays.jl", subdir = "lib/Two"}
+        ,
+            .{ .url = url, .subdir = "lib/One" },
+        );
+        const rep = try run(f.arena(), testing.allocator, testing.io, .{
+            .env_path = env,
+            .stack = try f.stack(),
+            .julia_prefix = prefix,
+        });
+        try testing.expectEqual(@as(usize, 1), rep.problems.len);
+        try testing.expectEqualStrings("lib/Two", rep.problems[0].want);
+    }
 }
 
 test "a [sources] path is project-relative, not manifest-relative" {

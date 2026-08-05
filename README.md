@@ -104,11 +104,49 @@ piece that matters: after an import, stock `Pkg.precompile()` rebuilds
 compiled locally. Entries that are only meaningful where they were built
 (non-relocatable paths) are detected and never published.
 
-**Where Pkg remains the only implementation.** `Apps`, `undo`/`redo` and
-`[workspace]` are not implemented; the Julia wrapper forwards them to Pkg,
-with `Ajt.parity()` printing the live list and the reasons. Pkg is also the
-only one of the two that can *write* a precompile cache entry — Ajt invokes
-Julia to do that and never forges a `.ji` header.
+**A `[sources]` edit that actually re-resolves.** Pkg's `project_hash` digests
+deps, weakdeps and compat — and not `[sources]`. So adding a source entry, or
+moving a `rev` in one, changes the fingerprint by nothing: the manifest is
+judged current, the repository is never re-cloned, and the edit silently does
+nothing ([#4157](https://github.com/JuliaLang/Pkg.jl/issues/4157),
+[#4351](https://github.com/JuliaLang/Pkg.jl/issues/4351)). Ajt keeps the hash
+byte-exact — widening it would make every manifest it writes look stale to
+stock Pkg, which is the interop the hash exists to provide — and puts the
+stricter answer in `verify`, which compares `[sources]` against what the
+manifest actually recorded:
+
+```console
+$ ajt verify
+sources_not_applied  Foo   the manifest does not reflect this [sources] entry
+    want v2.1  got main
+    resolve to apply the new rev (JuliaLang/Pkg.jl#4157)
+```
+
+`tools/diff_harness/sources_staleness.sh` pins both halves of that: it requires
+`Pkg.is_manifest_current` to still answer **true** on the same environment
+(without which the gate would be guarding a bug that no longer exists), and
+requires ajt's `project_hash` to equal Julia's byte for byte, so the divergence
+is provably in the check and not in the digest.
+
+**Where Pkg remains the only implementation.** `undo`/`redo` and `[workspace]`
+are not implemented, nor is `app add`/`app update` — the two app verbs that
+begin with a registry version solve and a download. The Julia wrapper forwards
+all of them to Pkg, with `Ajt.parity()` printing the live list and the reasons.
+Pkg is also the only one of the two that can *write* a precompile cache entry —
+Ajt invokes Julia to do that and never forges a `.ji` header.
+
+**Apps, minus a Windows bug.** `ajt app dev|rm|status` implements `Pkg.Apps`:
+the `AppManifest.toml` and the POSIX shim it writes are byte-identical to
+Pkg's, and an environment moves between the two tools in either direction
+(`tools/diff_harness/apps.sh` installs the same package through both, diffs
+every artefact, and *runs* both shims). One deliberate difference, and it is a
+fix: Pkg's Windows `.bat` stores `julia_cmd` already quoted and then quotes it
+again at the call site, so an app cannot start at all when the depot path
+contains a space — [#4741](https://github.com/JuliaLang/Pkg.jl/issues/4741),
+still open. Ajt stores it unquoted, and the generated file says so in its
+header. The gate re-derives Pkg's buggy line from the live Julia rather than
+hard-coding it, so if upstream fixes #4741 the deviation is reported as
+obsolete instead of quietly guarding nothing.
 
 `ajt build` runs `deps/build.jl` the way `Pkg.build` does — same order, same
 `build.log` paths, same `scratch_usage.toml` entry, gated by
@@ -152,6 +190,7 @@ ajt help               # every command and flag
 | `precompile` | compile the environment; `--only P[,P…]` restricts to a closure, `--cache-url` reads/publishes the shared cache |
 | `build` | run each package's `deps/build.jl`, in dependency order, in a sandbox |
 | `test` | run a package's test suite in Pkg's sandbox — same flags, same transcript, same failure sentences |
+| `app {dev,rm,status}` | install a package's `[apps]` as executables in `<depot>/bin` |
 | `status` | Pkg's status report, byte for byte |
 | `verify` | is this environment ready? |
 | `manifest {current,upgrade}` | was this manifest resolved from this project? migrate v1 → v2 |
@@ -270,6 +309,9 @@ tools/diff_harness/reresolve.sh                     # free re-resolve vs Pkg.upd
 tools/diff_harness/generate.sh                      # scaffolding vs Pkg.generate
 tools/diff_harness/build.sh                         # deps/build.jl vs Pkg.build
 tools/diff_harness/status.sh                        # the report vs Pkg.status (network)
+tools/diff_harness/apps.sh                          # ajt app vs Pkg.Apps, shims run
+tools/diff_harness/shell_escape.sh                  # Base.shell_escape{,_wincmd}
+tools/diff_harness/sources_staleness.sh             # the [sources] divergence
 tools/diff_harness/fallback_gates.sh                # Ajt <-> Pkg interop
 ```
 
@@ -325,8 +367,8 @@ src/
   depot.zig         DEPOT_PATH, depot layout, atomic install
   ops/              one Pkg verb each: resolve, edit (add/rm/up), why,
                     instantiate, precompile, build, verify, install, registry,
-                    usage — plus sandbox (the temp environment build and test
-                    share) and child (running a child `julia`)
+                    usage, apps — plus sandbox (the temp environment build and
+                    test share) and child (running a child `julia`)
 julia/              the Ajt.jl wrapper package and its `]`-mode REPL
 tools/diff_harness/ differential tests against Julia as oracle
 ```
