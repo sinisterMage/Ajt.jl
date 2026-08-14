@@ -249,7 +249,6 @@ pub const Backend = struct {
         /// when the fast-forward did not apply. `error.MergeFailed` where Pkg
         /// records "registry failed to rebase on origin/$branch".
         rebase: *const fn (ctx: *anyopaque, gpa: Allocator, io: Io, path: []const u8, upstream: []const u8) Error!void,
-
     };
 
     pub fn ensureClone(
@@ -313,7 +312,6 @@ pub const Backend = struct {
     pub fn rebase(self: Backend, gpa: Allocator, io: Io, path: []const u8, upstream: []const u8) Error!void {
         return self.vtable.rebase(self.ctx, gpa, io, path, upstream);
     }
-
 
     /// The one gate every remote passes through before a backend sees it.
     ///

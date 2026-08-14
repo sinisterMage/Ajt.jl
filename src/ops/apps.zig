@@ -450,9 +450,9 @@ fn windowsShim(
         \\)
         \\
     , .{
-        c,     c,           shim_version, c,     c,
-        spec.env, depot_path, julia_escaped,
-        flags, mod_escaped, flags,        mod_escaped,
+        c,        c,           shim_version,  c,     c,
+        spec.env, depot_path,  julia_escaped, flags, mod_escaped,
+        flags,    mod_escaped,
     });
 }
 

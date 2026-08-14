@@ -1,6 +1,10 @@
 .{
     .name = .ajt,
-    .version = "0.0.1",
+    // One version for the whole repository: the binary, the wrapper package in
+    // `julia/`, and the `v<version>` tag a release is cut from. They were three
+    // different numbers before anything published, which is the cheapest moment
+    // to make them one.
+    .version = "0.1.0",
     // Globally unique together with .name; generated once by the toolchain.
     .fingerprint = 0x7e2e4e0d036a917d, // Changing this has security and trust implications.
 

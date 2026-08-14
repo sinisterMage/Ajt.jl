@@ -1584,9 +1584,8 @@ fn sourceProjectVersion(
         }
     }
     const text = src orelse {
-        noteFailure(opts, arena,
-            "could not find project file (Project.toml or JuliaProject.toml) in package at `{s}` " ++
-                "maybe `subdir` needs to be specified\n", .{dir});
+        noteFailure(opts, arena, "could not find project file (Project.toml or JuliaProject.toml) in package at `{s}` " ++
+            "maybe `subdir` needs to be specified\n", .{dir});
         return Error.SourceProjectMismatch;
     };
 
@@ -1596,18 +1595,15 @@ fn sourceProjectVersion(
     };
     if (p.uuid) |u| {
         if (!std.mem.eql(u8, &u.bytes, &uuid.bytes)) {
-            noteFailure(opts, arena,
-                "UUID `{s}` given by project file `{s}` does not match given UUID `{s}`\n", .{
-                    try uuidText(arena, u), file, try uuidText(arena, uuid),
-                });
+            noteFailure(opts, arena, "UUID `{s}` given by project file `{s}` does not match given UUID `{s}`\n", .{
+                try uuidText(arena, u), file, try uuidText(arena, uuid),
+            });
             return Error.SourceProjectMismatch;
         }
     }
     if (p.name) |n| {
         if (!std.mem.eql(u8, n, name)) {
-            noteFailure(opts, arena,
-                "name `{s}` given by project file `{s}` does not match given name `{s}`\n",
-                .{ n, file, name });
+            noteFailure(opts, arena, "name `{s}` given by project file `{s}` does not match given name `{s}`\n", .{ n, file, name });
             return Error.SourceProjectMismatch;
         }
     }
@@ -1653,7 +1649,7 @@ const InstalledCtx = struct {
         // a filter has no business mutating the resolve, and the memo does not
         // — it only remembers. Keeping the vtable pointer const is worth this
         // one line.
-        const self: *InstalledCtx = @constCast(@ptrCast(@alignCast(ctx)));
+        const self: *InstalledCtx = @ptrCast(@alignCast(@constCast(ctx)));
         if (self.seen.get(tree_hash)) |hit| return hit;
 
         const answer = blk: {

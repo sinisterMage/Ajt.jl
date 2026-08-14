@@ -953,28 +953,28 @@ test "gen_target_project: extras before weakdeps, compat carried, unknown name e
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "Project.toml", .data =
-    \\name = "Fixture"
-    \\uuid = "00000000-0000-0000-0000-0000000000f1"
-    \\
-    \\[deps]
-    \\Dep = "00000000-0000-0000-0000-0000000000d1"
-    \\
-    \\[weakdeps]
-    \\Weak = "00000000-0000-0000-0000-0000000000aa"
-    \\
-    \\[extras]
-    \\Extra = "00000000-0000-0000-0000-0000000000e1"
-    \\Unrelated = "00000000-0000-0000-0000-0000000000c0"
-    \\Weak = "00000000-0000-0000-0000-0000000000ff"
-    \\
-    \\[compat]
-    \\Dep = "1.2"
-    \\Extra = "0.5"
-    \\Unrelated = "3"
-    \\
-    \\[targets]
-    \\build = ["Extra", "Weak"]
-    \\
+        \\name = "Fixture"
+        \\uuid = "00000000-0000-0000-0000-0000000000f1"
+        \\
+        \\[deps]
+        \\Dep = "00000000-0000-0000-0000-0000000000d1"
+        \\
+        \\[weakdeps]
+        \\Weak = "00000000-0000-0000-0000-0000000000aa"
+        \\
+        \\[extras]
+        \\Extra = "00000000-0000-0000-0000-0000000000e1"
+        \\Unrelated = "00000000-0000-0000-0000-0000000000c0"
+        \\Weak = "00000000-0000-0000-0000-0000000000ff"
+        \\
+        \\[compat]
+        \\Dep = "1.2"
+        \\Extra = "0.5"
+        \\Unrelated = "3"
+        \\
+        \\[targets]
+        \\build = ["Extra", "Weak"]
+        \\
     });
 
     const empty_manifest: Manifest = .{};
@@ -1011,15 +1011,15 @@ test "gen_target_project: extras before weakdeps, compat carried, unknown name e
     // other two (`:2367-2371`). So `targets.build = ["Dep"]` for a plain
     // dependency parses fine and then fails here, exactly as Pkg does.
     try tmp.dir.writeFile(io, .{ .sub_path = "Project.toml", .data =
-    \\name = "Fixture"
-    \\uuid = "00000000-0000-0000-0000-0000000000f1"
-    \\
-    \\[deps]
-    \\Dep = "00000000-0000-0000-0000-0000000000d1"
-    \\
-    \\[targets]
-    \\build = ["Dep"]
-    \\
+        \\name = "Fixture"
+        \\uuid = "00000000-0000-0000-0000-0000000000f1"
+        \\
+        \\[deps]
+        \\Dep = "00000000-0000-0000-0000-0000000000d1"
+        \\
+        \\[targets]
+        \\build = ["Dep"]
+        \\
     });
     try testing.expectError(error.TargetDepUnknown, genTargetProject(arena, io, .{
         .project_file = "unused",

@@ -10,3 +10,6 @@ zig-pkg/
 # The wrapper package resolves against whatever Julia is running it; a
 # committed manifest would pin a library to one machine.
 julia/Manifest.toml
+
+# Built by packaging/gen_artifacts.jl; the release workflow uploads it.
+dist/

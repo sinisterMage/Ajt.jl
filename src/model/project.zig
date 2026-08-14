@@ -1285,8 +1285,8 @@ fn setMessage(
 /// even though `destructure` never writes it — the passthrough copy carries it,
 /// and this is what places it between `[sources]` and `[compat]`.
 const project_key_order = [_][]const u8{
-    "name",      "uuid",   "keywords", "license",  "desc",       "version",
-    "workspace", "deps",   "weakdeps", "sources",  "extensions", "compat",
+    "name",      "uuid", "keywords", "license", "desc",       "version",
+    "workspace", "deps", "weakdeps", "sources", "extensions", "compat",
 };
 
 /// `project_key_order(key)` (`project.jl:310-311`): the position in the list, or

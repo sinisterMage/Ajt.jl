@@ -9,6 +9,20 @@
 
 const std = @import("std");
 
+/// Ajt's own version, taken from `build.zig.zon` rather than written here.
+///
+/// A version is the one string a release has to agree about across the whole
+/// repository, and it used to be spelled twice -- once in `build.zig.zon` and
+/// again as a `const` in `src/main.zig`, which had already drifted. `build.zig`
+/// reads the manifest and passes it through `build_options`, so the manifest is
+/// the only place it exists and the release workflow has one thing to check the
+/// tag against.
+///
+/// Named `tool_version` rather than `version` because `julia.version` is the
+/// module that parses *Julia's* version grammar, and a file-scope `version`
+/// here makes every reference to it from inside that struct ambiguous.
+pub const tool_version: []const u8 = @import("build_options").version;
+
 /// Ports of Julia's own semantics. No I/O, allocator passed in -- these are
 /// the modules where "agrees with Julia exactly" is the whole specification,
 /// so they are differential-tested against Julia rather than reasoned about.

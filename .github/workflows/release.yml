@@ -1,0 +1,162 @@
+# Cut a release from a `v<version>` tag.
+#
+# Everything is cross-compiled from one Linux runner, because that is what Zig
+# is for: `zig build -Dtarget=…` produces the macOS and Linux binaries from the
+# same machine, libgit2 included, with no per-OS build farm and no chance of two
+# platforms being built from different states of the tree.
+#
+# Native runners still appear, but only to *run* what was built. A release that
+# ships a binary nobody executed is not a release.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  version:
+    name: tag matches build.zig.zon
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      # `build.zig.zon` is the only place the version is written; `build.zig`
+      # passes it through `build_options` and `ajt version` prints it. So there
+      # is exactly one string to agree with, and this is where the tag has to
+      # agree with it — before anything is built or published.
+      - id: check
+        run: |
+          set -euo pipefail
+          tag='${{ github.event.inputs.tag || github.ref_name }}'
+          manifest=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' build.zig.zon | head -1)
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "v$manifest" ]; then
+            echo "::error::tag $tag does not match build.zig.zon version $manifest (expected v$manifest)"
+            exit 1
+          fi
+          # The wrapper package ships in the same tag, so it moves in lockstep.
+          wrapper=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' julia/Project.toml | head -1)
+          if [ "$wrapper" != "$manifest" ]; then
+            echo "::error::julia/Project.toml version $wrapper does not match build.zig.zon $manifest"
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build and package every target
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+
+      # One script builds all four targets, packages both tarball shapes, and
+      # writes the checksums — the same script a maintainer runs before tagging.
+      # `--check` then asserts that the committed `julia/Artifacts.toml`
+      # describes exactly these bytes.
+      #
+      # That check is the whole contract. `Artifacts.toml` records a SHA-256 per
+      # platform and ships inside the registered package, so it has to be
+      # committed before the tag exists; if CI packaged the release by some
+      # other route, `add Ajt` would download a tarball whose hash the package
+      # disagrees with, and it would fail for users rather than here.
+      - name: Build, package, and verify Artifacts.toml
+        run: julia --project=julia packaging/gen_artifacts.jl --check --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: run it on ${{ matrix.runner }}
+    needs: [version, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-linux-musl }
+          - { runner: macos-14, target: aarch64-macos }
+          - { runner: macos-13, target: x86_64-macos }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # Unpack exactly what a user would download, and run it. This is the only
+      # step that proves the cross-compiled binary is executable on the machine
+      # it was built for, rather than merely well-formed.
+      - name: Unpack and run
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/ajt-$VERSION-${{ matrix.target }}.tar.gz"
+          bin="ajt-$VERSION-${{ matrix.target }}/bin/ajt"
+          "$bin" help > /dev/null
+          printed=$("$bin" version)
+          echo "$printed"
+          if [ "$printed" != "ajt $VERSION" ]; then
+            echo "::error::ajt version printed '$printed', expected 'ajt $VERSION'"
+            exit 1
+          fi
+          # The licence that has to travel with a statically linked libgit2.
+          test -f "ajt-$VERSION-${{ matrix.target }}/share/licenses/Ajt/LICENSE.libgit2"
+
+  publish:
+    name: publish the release
+    needs: [version, build, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: staging
+      - run: ls -l staging
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Idempotent on re-run: a release that already exists gets its assets
+          # replaced rather than a second release appearing next to it.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" staging/* --clobber
+          else
+            gh release create "$TAG" staging/* \
+              --title "ajt $TAG" \
+              --generate-notes
+          fi

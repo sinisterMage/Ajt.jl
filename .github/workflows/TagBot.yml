@@ -1,0 +1,51 @@
+# Tag registered versions of the `Ajt` wrapper package.
+#
+# TagBot watches the General registry and creates the `v<version>` tag once a
+# registration is merged. Two things about this repository make that more than
+# boilerplate:
+#
+#   * `subdir: julia` — the package is not at the repository root. Without it
+#     TagBot looks for a Project.toml that is not there and does nothing.
+#   * That tag is what `release.yml` triggers on, so one registration produces
+#     one tag, one set of binaries and one registered version, all from the same
+#     commit. It is also why `version` in `julia/Project.toml` and `.version` in
+#     `build.zig.zon` are checked against each other before anything publishes:
+#     if they ever drift, this workflow tags a release the binaries disagree
+#     with.
+
+name: TagBot
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      lookback:
+        default: '3'
+
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  deployments: read
+  issues: read
+  discussions: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  security-events: read
+  statuses: read
+
+jobs:
+  TagBot:
+    # Only the registry bot's comments, so an ordinary issue comment cannot
+    # start a tagging run.
+    if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: JuliaRegistries/TagBot@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          subdir: julia
+          lookback: ${{ github.event.inputs.lookback || 3 }}

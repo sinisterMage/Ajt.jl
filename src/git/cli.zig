@@ -486,7 +486,6 @@ fn parseSha1(raw: []const u8) ?Sha1 {
     return Sha1.parse(text) catch null;
 }
 
-
 fn treeOf(
     ctx: *anyopaque,
     gpa: Allocator,

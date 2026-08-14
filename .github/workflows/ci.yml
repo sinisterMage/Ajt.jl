@@ -1,0 +1,177 @@
+# Ajt CI.
+#
+# Two things are being checked, and they fail for different reasons: the Zig
+# binary (formatting, unit tests, and that every target a release ships still
+# compiles) and the Julia wrapper in `julia/` (its own suite, plus the one
+# invariant a registry install depends on).
+#
+# The differential gates in `tools/diff_harness/` are deliberately NOT here.
+# Fifteen of the forty-seven reach for `$REPO_ROOT/Open-Reality`, an environment
+# from the private monorepo Ajt was developed in, and most of the rest need the
+# network and a warm depot. Running the runnable subset belongs in a scheduled
+# workflow, not on every push, where it would be slow and flaky at once.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # `build.zig.zon` pins this exactly: Zig 0.16 moved Dir/File/cwd into std.Io
+  # and removed std.Thread.Pool, and Ajt lives on exactly those surfaces.
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  fmt:
+    name: zig fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check build.zig src
+
+  test:
+    name: unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The pure-Zig half, which is the half that must never need the network:
+      # libgit2 is a lazy dependency and `-Dgit` is what asks for it.
+      - run: zig build test
+
+  test-git:
+    name: unit tests + libgit2 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # Without `-Dgit` this step fails on purpose rather than quietly running a
+      # suite in which every libgit2 test was compiled out.
+      - run: zig build test-git -Dgit
+
+  cross:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-musl, git: true }
+          - { target: aarch64-linux-musl, git: true }
+          - { target: x86_64-macos, git: true }
+          - { target: aarch64-macos, git: true }
+          # Windows is expected to fail today, and is here to say so out loud
+          # rather than by omission. Three call sites in Ajt need porting
+          # (`src/julia/treehash.zig` and `src/ops/apps.zig` use
+          # `Io.File.Permissions.{to,from}Mode`, which the Windows variant does
+          # not have; `src/ops/test.zig` names `SIG.HUP`) and a fourth failure
+          # is upstream: Zig 0.16.0's own `std/Io/File.zig` references
+          # `os.windows.FILE_ATTRIBUTE_READONLY`, which does not exist. That
+          # last one cannot be fixed from this repository, so this stays
+          # non-blocking until the toolchain moves.
+          - { target: x86_64-windows-gnu, git: false, allow-failure: true }
+    continue-on-error: ${{ matrix.allow-failure == true }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # Every target a release publishes gets built on every pull request, so a
+      # tag is never the first time anyone tried.
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast ${{ matrix.git && '-Dgit' || '' }}
+
+  julia:
+    name: wrapper tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # The suite has three layers and the third one — the behavioural tests —
+      # skips itself with a message when there is no binary. Building first is
+      # what makes this job test more than metadata.
+      - run: zig build
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+        with:
+          project: julia
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          project: julia
+        env:
+          # `binary_candidates()` would find `julia/../zig-out/bin/ajt` on its
+          # own; naming it means a failure here is never ambiguous about which
+          # binary ran.
+          AJT_BINARY: ${{ github.workspace }}/zig-out/bin/ajt
+
+  julia-no-binary:
+    name: wrapper loads without a binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      # No Zig, no `zig-out/`, no `$AJT_BINARY`, nothing named `ajt` on PATH.
+      # `using Ajt` still has to succeed: this is exactly what the General
+      # registry's AutoMerge does to a package, and it is also what any user
+      # gets between `] add Ajt` and their first command.
+      #
+      # Then either outcome is correct, and which one it is depends only on
+      # whether a release exists yet for the version in build.zig.zon: the
+      # artifact downloads and `ajt version` agrees with the manifest, or
+      # nothing is found and `binary()` says so by naming every path it tried.
+      # What must never happen is a load failure, an exception from listing
+      # candidates, or a binary that reports a different version.
+      - run: |
+          julia --project=julia -e '
+            using Pkg; Pkg.instantiate()
+            using Ajt
+            @assert !isempty(Ajt.binary_candidates())
+            version = only(match(r"\"([^\"]+)\"", first(filter(
+                l -> occursin(r"^\s*\.version\s*=", l), readlines("build.zig.zon")))).captures)
+            try
+                path = Ajt.binary(refresh = true)
+                printed = strip(read(`$path version`, String))
+                @assert printed == "ajt $version" printed
+                println("Ajt loaded and fetched its own binary: ", printed)
+            catch err
+                err isa AssertionError && rethrow()
+                msg = sprint(showerror, err)
+                @assert occursin("was not found", msg) msg
+                println("Ajt loaded; no binary published for v$version yet:\n", msg)
+            end'

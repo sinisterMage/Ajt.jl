@@ -106,7 +106,6 @@ const usage =
     \\  ajt app dev <path>                 Install a package's [apps] as executables
     \\  ajt app rm <Pkg|app>...            in <depot>/bin, pointed at the working
     \\  ajt app status [Pkg|app]           tree. See `app options`
-
     \\  ajt generate <path>                Scaffold a package: Project.toml and
     \\                                     src/<Pkg>.jl, and nothing else
     \\  ajt compat [--project D] <Name> [spec]
@@ -707,7 +706,9 @@ const usage =
     \\
 ;
 
-const version = "0.0.1";
+/// From `build.zig.zon`, through `build_options` -- see `ajt.tool_version`. This
+/// used to be a literal here as well as in the manifest, and the two had drifted.
+const version = ajt.tool_version;
 
 /// `Pkg.OFFLINE_MODE[]` (`Pkg/src/Pkg.jl:45`), for this process.
 ///

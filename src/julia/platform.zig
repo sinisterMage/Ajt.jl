@@ -397,7 +397,7 @@ pub fn triplet(gpa: Allocator, p: Platform) Allocator.Error![]u8 {
 
 fn isStructuralKey(k: []const u8) bool {
     const structural = [_][]const u8{
-        "os",              "arch",              "libc",       "call_abi",
+        "os",                  "arch",              "libc",          "call_abi",
         "libgfortran_version", "libstdcxx_version", "cxxstring_abi", "os_version",
     };
     for (structural) |s| {
@@ -884,9 +884,9 @@ test "construct: arch aliases and case folding" {
     defer a.deinit();
     const arena = a.allocator();
     inline for (.{
-        .{ "AMD64", "x86_64" }, .{ "amd64", "x86_64" }, .{ "i386", "i686" },
-        .{ "i486", "i686" },    .{ "i586", "i686" },    .{ "ARM", "armv7l" },
-        .{ "armv6", "armv6l" }, .{ "armv7", "armv7l" }, .{ "armv8", "armv7l" },
+        .{ "AMD64", "x86_64" },  .{ "amd64", "x86_64" },  .{ "i386", "i686" },
+        .{ "i486", "i686" },     .{ "i586", "i686" },     .{ "ARM", "armv7l" },
+        .{ "armv6", "armv6l" },  .{ "armv7", "armv7l" },  .{ "armv8", "armv7l" },
         .{ "armv8l", "armv7l" }, .{ "arm64", "aarch64" }, .{ "ppc64le", "powerpc64le" },
         .{ "x86_64", "x86_64" },
     }) |c| {

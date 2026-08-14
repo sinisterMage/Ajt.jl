@@ -167,13 +167,41 @@ nothing that runs arbitrary code behind your back.
 
 ## Install
 
+A prebuilt binary, from the [latest release](https://github.com/sinisterMage/Ajt.jl/releases/latest):
+
+| | |
+|---|---|
+| Linux | `ajt-<version>-x86_64-linux-musl.tar.gz` · `…-aarch64-linux-musl.tar.gz` |
+| macOS | `ajt-<version>-aarch64-macos.tar.gz` · `…-x86_64-macos.tar.gz` |
+
+The Linux builds are static musl binaries with no shared-library dependency at
+all; every build links libgit2 statically, so nothing needs installing beside
+them. Each asset's SHA-256 is in `SHA256SUMS` on the release. Put `ajt` anywhere
+on `PATH`.
+
+Windows is not built yet — see *Building* below for exactly what is missing.
+
+### Building
+
 Requires **Zig 0.16.0** exactly (pinned in `build.zig.zon`).
 
 ```sh
 zig build              # -> zig-out/bin/ajt
 zig build test         # unit tests
+zig build -Dgit        # ... with the libgit2 backend (fetches ~30 MB of C)
 ajt help               # every command and flag
 ```
+
+Cross-compiling is `zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast`;
+that is how the releases are built, all of them from one Linux machine.
+
+Windows does not compile today. Three call sites need porting —
+`src/julia/treehash.zig` and `src/ops/apps.zig` reach for
+`Io.File.Permissions.{to,from}Mode`, which the Windows variant does not have,
+and `src/ops/test.zig` names `SIG.HUP` — and a fourth failure is upstream, in
+Zig 0.16.0's own `std/Io/File.zig`, which references
+`os.windows.FILE_ATTRIBUTE_READONLY`. That one cannot be fixed from here, so the
+target stays non-blocking in CI until the toolchain moves.
 
 ## Commands
 
@@ -227,10 +255,14 @@ A `develop`ed, repo-tracked or pinned entry holds at every level.
 `julia/` is a wrapper package exposing Pkg's API and a `]`-style REPL mode:
 
 ```julia
-pkg> add /path/to/packages/ajt/julia
+pkg> add https://github.com/sinisterMage/Ajt.jl.git:julia
 julia> using Ajt        # `]` becomes `ajt>`; set AJT_REPL=0 to keep Pkg's
 julia> Ajt.parity()     # what is native, what delegates, and why
 ```
+
+Putting `using Ajt` in `~/.julia/config/startup.jl` is the intended way to
+install it: `]` is then Ajt's from the first prompt of every session. Loading it
+later works too, whether or not Pkg's own `]` mode has already been used.
 
 Every function `Pkg` makes public exists in `Ajt` from day one — implemented
 against the binary where Ajt has it, forwarded to `Pkg` with a one-line notice
@@ -239,7 +271,11 @@ enumerates `names(Pkg)` and reports anything in neither bucket, and the test
 suite fails on a non-empty report, so a hole cannot open quietly.
 
 The binary is found via `$AJT_BINARY`, then a sibling `../zig-out/bin/ajt`, then
-`PATH`; when none exists the error names every path it tried.
+the release binary for this version if it is already installed, then `PATH`. If
+none of those exist it is downloaded once — the same asset as *Install* above,
+verified against the tree hash in `julia/Artifacts.toml` — and only if that also
+fails does it error, naming every path it tried. Listing the candidates never
+touches the network; only the last resort does.
 
 ## Interoperability
 

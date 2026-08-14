@@ -15,11 +15,11 @@ const std = @import("std");
 /// set is CLOSED and exact: lowercase, Capitalized and UPPERCASE only, so
 /// `tRue` is in neither list and `on`/`off` are in neither either.
 pub const truthy = [_][]const u8{
-    "t",   "T",
+    "t",    "T",
     "true", "True",
     "TRUE", "y",
-    "Y",   "yes",
-    "Yes", "YES",
+    "Y",    "yes",
+    "Yes",  "YES",
     "1",
 };
 

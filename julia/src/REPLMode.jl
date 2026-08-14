@@ -133,6 +133,23 @@ So this does what that keypress does. `REPL.load_pkg()`
 is reachable without depending on it — the live REPL object is one of its types.
 Waiting for the user to press `]` instead would mean Pkg's extension builds the
 `pkg>` mode at a moment nothing is watching, and the take-over never happens.
+
+# Why the return value, and not `Base.get_extension`
+
+`get_extension` answers `nothing` for a REPLExt that is **loaded and running**,
+whenever that extension was loaded through `load_pkg()` — which is exactly what
+pressing `]` does, so it is the answer in every session where the user reached
+for Pkg before reaching for Ajt.
+
+`load_pkg()` is `Base.require_stdlib(Pkg_pkgid, "REPLExt", REPL)`, and
+`require_stdlib`'s bundled-depot path loads the module through
+`_require_search_from_serialized` without ever registering it as a root module
+(`base/loading.jl`). `get_extension` is a `maybe_root_module` lookup
+(`loading.jl:1681-1685`), so it misses it. Calling `load_pkg()` and then asking
+`get_extension` a second time — which is what this function used to do — threw
+away the one answer that is always correct and reported failure instead.
+`activate!` then took its `ext === nothing` branch, `autoactivate!` had asked
+for that quietly, and `]` stayed on `pkg>` with nothing said.
 """
 function _replext(repl = nothing)
     ext = Base.get_extension(Pkg, :REPLExt)
@@ -141,13 +158,12 @@ function _replext(repl = nothing)
     replmod = parentmodule(typeof(repl))
     if isdefined(replmod, :load_pkg)
         try
-            replmod.load_pkg()
+            loaded = replmod.load_pkg()
+            loaded isa Module && return loaded
         catch err
             @debug "Ajt: REPL.load_pkg() failed" exception = err
         end
     end
-    ext = Base.get_extension(Pkg, :REPLExt)
-    ext === nothing || return ext
     # Older/odd loaders: importing REPL into this environment triggers the
     # extension the ordinary way.
     try
@@ -225,8 +241,14 @@ function activate!(repl = nothing; quiet::Bool = false)
     if isempty(modes)
         # Pkg's own hook has not built the mode yet. Building it here is safe:
         # `repl_init` is what that hook would have called.
+        #
+        # `invokelatest` because this branch is reached precisely when
+        # `_replext` has just *loaded* REPLExt in this task: its methods are
+        # then newer than the task's world age, and a plain call raises rather
+        # than running. The `try` below would swallow that, and `quiet` would
+        # hide it — the same shape of silent failure this whole path had.
         try
-            ext.repl_init(repl)
+            Base.invokelatest(ext.repl_init, repl)
         catch err
             quiet || @warn "Ajt: could not create the `pkg>` mode" exception = err
             return false
@@ -261,6 +283,42 @@ function deactivate!()
 end
 
 """
+    _activate_soon(repl)
+
+Take over `repl` from a task, retrying while the REPL finishes standing itself
+up, and say so once if it never does.
+
+The task is not an optimisation. `Base.atreplinit` *prepends*
+(`base/client.jl:372`), so hooks registered later run earlier, and the REPL is
+not finished standing up while they run. A task runs at the first yield — the
+read on stdin — which is after everything and still long before a human can
+type.
+
+Both callers share the retry *and* the warning. The immediate path used to have
+neither: it took its one shot with `quiet = true`, and every way
+[`activate!`](@ref) can answer `false` was therefore invisible. That is what
+kept a real defect in [`_replext`](@ref) in the tree — the feature did nothing
+and said nothing.
+"""
+function _activate_soon(repl)
+    return Base.errormonitor(
+        @async begin
+            for _ in 1:40
+                activate!(repl; quiet = true) && return nothing
+                sleep(0.05)
+            end
+            # A REPL with no `interface` is not one Pkg's own extension can
+            # build a mode in either (`REPLExt.jl:337-341` says as much), so
+            # there is no take-over to have missed: `julia -i` with piped
+            # stdin gets a `BasicREPL`, which has no `]` at all.
+            hasfield(typeof(repl), :interface) || return nothing
+            @warn "Ajt: could not take over the `pkg>` prompt; run `Ajt.REPLMode.activate!()` for the reason."
+            return nothing
+        end
+    )
+end
+
+"""
 Best-effort take-over at REPL startup, called from `Ajt.__init__`. Set
 `AJT_REPL=0` to keep `]` on Pkg.
 
@@ -273,34 +331,23 @@ working and doing nothing at all:
   processing arguments, before the REPL exists and therefore before
   `isinteractive()` is true. Guarding the registration would skip the one case
   it is for.
-* The take-over runs from a task rather than in the hook. `Base.atreplinit`
-  *prepends* (`base/client.jl:372`), so hooks registered later run earlier, and
-  the REPL is not finished standing up while they run. A task runs at the first
-  yield — the read on stdin — which is after everything and still long before a
-  human can type.
+* An already-running REPL never fires another hook, so `using Ajt` typed at the
+  prompt takes over through the immediate path instead.
 
-An already-running REPL never fires another hook, so `using Ajt` typed at the
-prompt takes over through the immediate path instead.
+Both go through [`_activate_soon`](@ref), which is where the retry and the one
+warning live.
 """
 function autoactivate!()
     get(ENV, "AJT_REPL", "1") == "0" && return nothing
     # Already at a prompt: no hook will ever fire again, so do it now.
     if isdefined(Base, :active_repl)
-        Base.errormonitor(@async activate!(Base.active_repl; quiet = true))
+        _activate_soon(Base.active_repl)
         return nothing
     end
     Base.atreplinit() do repl
         isinteractive() || return nothing
-        Base.errormonitor(
-            @async begin
-                for _ in 1:40
-                    activate!(repl; quiet = true) && return nothing
-                    sleep(0.05)
-                end
-                @warn "Ajt: could not take over the `pkg>` prompt; run `Ajt.REPLMode.activate!()` for the reason."
-                return nothing
-            end
-        )
+        _activate_soon(repl)
+        return nothing
     end
     return nothing
 end

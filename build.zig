@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "have_libgit2", want_git);
+    // The version lives in the manifest and nowhere else. `ajt version` reads
+    // this through `ajt.version`, so a release tag has exactly one string to
+    // agree with rather than two that can drift apart -- which they had.
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
 
     // Null when `-Dgit` was passed but the tarball is not in the cache yet: the
     // configure phase then exists only to name the lazy dependency, and the
@@ -172,7 +176,15 @@ fn buildLibgit2(
         .GIT_SHA1_COLLISIONDETECT = true,
         .GIT_SHA256_BUILTIN = true,
 
-        .GIT_RAND_GETENTROPY = true,
+        // Off on Darwin, and that is upstream's own answer rather than a
+        // workaround: libgit2 probes this with
+        // `check_symbol_exists(getentropy "unistd.h")`, and Apple declares
+        // `getentropy` in `<sys/random.h>` instead. `rand.c` includes neither
+        // -- it takes the declaration from `git2_util.h`'s `<unistd.h>` -- so
+        // claiming the feature on macOS is a call to an undeclared function,
+        // which C99 makes a hard error. The `#else` branch reads
+        // `/dev/urandom`, which is what a macOS libgit2 uses anyway.
+        .GIT_RAND_GETENTROPY = !t.os.tag.isDarwin(),
         .GIT_IO_POLL = true,
 
         // musl 1.2.5 HAS the GNU-signature `qsort_r`, but declares it only

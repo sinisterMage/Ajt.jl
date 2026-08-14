@@ -13,6 +13,12 @@ Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
 [compat]
+# Every dependency needs a bound with a finite number of breaking releases, the
+# stdlibs included — General's AutoMerge checks for it, and `"1"` is what a
+# stdlib versioned with Julia itself can honestly claim.
+Dates = "1"
+Pkg = "1"
+REPL = "1"
 # 1.12 is a floor with teeth, not caution: `Pkg.Apps` is 1.12, the
 # `PRESERVE_*_INSTALLED` levels are 1.11, and this package re-exports all of
 # them as hard bindings — on an older Julia `using Ajt` would fail with an
@@ -21,7 +27,13 @@ Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 julia = "1.12"
 
 [extras]
+# A test dependency only. The package itself must never depend on REPL:
+# `REPLMode` reaches the REPL through `parentmodule(typeof(repl))` and through
+# Pkg's extension, precisely so that loading Ajt does not drag REPL into a
+# script or a server. The tests, which build a `LineEditREPL` to assert the
+# `]` take-over, do need to name it.
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["REPL", "Test"]

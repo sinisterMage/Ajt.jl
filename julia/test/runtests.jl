@@ -1,6 +1,7 @@
 using Test
 using Ajt
 import Pkg
+import REPL
 
 # The suite is in three layers, cheapest first:
 #
@@ -66,6 +67,59 @@ function delegates(f)
     end
     return any(r -> occursin("delegating to Pkg", r.message), logger.logs)
 end
+
+"""
+A pty, as `(slave::RawFD, master::Base.TTY)`.
+
+The `]` take-over only exists on a terminal, so testing it needs one. Julia
+tests its own REPL exactly this way (`test/testhelpers/FakePTYs.jl`) and, like
+that helper, this goes through `posix_openpt`/`grantpt`/`unlockpt` rather than
+`openpty` so it needs libc alone and no libutil.
+
+Throws rather than returning a sentinel; the caller decides whether a machine
+with no pty is a skip or a failure.
+"""
+function open_fake_pty()
+    flags = Base.Filesystem.JL_O_RDWR | Base.Filesystem.JL_O_NOCTTY
+    fdm = ccall(:posix_openpt, Cint, (Cint,), flags)
+    fdm == -1 && error("posix_openpt failed")
+    ccall(:grantpt, Cint, (Cint,), fdm) == 0 || error("grantpt failed")
+    ccall(:unlockpt, Cint, (Cint,), fdm) == 0 || error("unlockpt failed")
+    name = ccall(:ptsname, Ptr{UInt8}, (Cint,), fdm)
+    name == C_NULL && error("ptsname failed")
+    fds = ccall(:open, Cint, (Ptr{UInt8}, Cint), name, flags)
+    fds == -1 && error("opening the pty slave failed")
+    return RawFD(fds), Base.TTY(RawFD(fdm))
+end
+
+"""
+Did the child die inside Julia's own code loader, rather than failing at
+anything Ajt did?
+
+Matched on the frames the crash dump prints, because a segfault has no exception
+to catch: the child is simply gone and the only evidence is on the terminal.
+"""
+crashed_in_julias_loader(transcript) =
+    occursin("staticdata.c", transcript) && occursin("load_pkg", transcript)
+
+"""
+What to say when that happens. Stated once, here, because the alternative is a
+maintainer re-deriving it from a stack trace every time this gate goes red.
+"""
+const UPSTREAM_CRASH = """
+Julia crashed inside its own package-image loader. This is not an Ajt failure.
+
+Pressing `]` makes the REPL load Pkg's extension from a task it spawns
+(`REPL/src/REPL.jl:1439` -> `load_pkg`), and Julia segfaults restoring that
+image: `ijl_restore_package_image_from_file`, `src/staticdata.c`. Measured on
+one machine at roughly half of runs *with Ajt's take-over disabled entirely*
+(`AJT_REPL=0`), so it needs neither Ajt nor this test to happen — it is what a
+user gets for pressing `]`.
+
+This gate reports it rather than routing around it. Warming the extension in a
+child process before opening the pty makes it mostly go away, which is exactly
+why that is not done here: it would hide a crash real users hit.
+"""
 
 # A real environment to test against. `AJT_TEST_ENV` names a directory holding a
 # Project.toml and a Manifest.toml; without one, the active project is used when
@@ -571,6 +625,189 @@ end
         @test !isdefined(Base, :active_repl)
         @test (@test_logs (:warn,) match_mode = :any Ajt.REPLMode.activate!()) === false
         @test Ajt.REPLMode.deactivate!() === false
+    end
+
+    @testset "REPL mode take-over" begin
+        # The take-over itself — `]` becoming `ajt>` — used to be untested by
+        # construction: the only thing reachable from a test process was
+        # `activate!()` with no REPL, which is the path that returns `false`.
+        # A `LineEditREPL` over in-memory streams is a real REPL object, and
+        # `setup_interface` builds it the same modes a terminal session gets,
+        # so every step from `_replext` to the prompt string can be asserted
+        # without a terminal.
+        term = REPL.Terminals.TTYTerminal("dumb", IOBuffer(), IOBuffer(), IOBuffer())
+        repl = REPL.LineEditREPL(term, false)
+        repl.history_file = false        # nothing here may touch ~/.julia/logs
+        repl.interface = REPL.setup_interface(repl)
+
+        ext = Ajt.REPLMode._replext(repl)
+        @test ext isa Module
+
+        # `setup_interface` builds REPL's placeholder `]` mode, not Pkg's, so
+        # this also covers the branch that calls `repl_init` itself.
+        @test Ajt.REPLMode.activate!(repl) === true
+        modes = Ajt.REPLMode._pkg_modes(repl, ext)
+        @test !isempty(modes)
+        @test all(m -> endswith(m.prompt(), "ajt> "), modes)
+
+        # Idempotent: a second call must not double-save the originals, or
+        # `deactivate!` would restore a prompt that is already ours.
+        @test Ajt.REPLMode.activate!(repl) === true
+        @test length(Ajt.REPLMode._PATCHED) == length(modes)
+
+        @test Ajt.REPLMode.deactivate!() === true
+        @test all(m -> endswith(m.prompt(), "pkg> "), modes)
+        @test Ajt.REPLMode.deactivate!() === false
+    end
+
+    @testset "REPL mode take-over over a pty" begin
+        # The gate for the regression this feature actually had, driven the
+        # way a person drives it: a real `julia -i` on a real terminal, `]`
+        # pressed *before* `using Ajt`, then `]` again.
+        #
+        # That ordering is the one that broke, and nothing cheaper reproduces
+        # it. `Base.get_extension(Pkg, :REPLExt)` answers `nothing` for a
+        # REPLExt that is loaded and running whenever it was loaded through
+        # `REPL.load_pkg()` — which is what the first `]` does — so
+        # `_replext`, which used to ask only `get_extension`, reported that
+        # there was no `pkg>` mode to take over. `autoactivate!` had asked for
+        # that quietly, so `]` stayed on `pkg>` and nothing was printed.
+        #
+        # Every layer below this passes with that defect in place: the routing
+        # tests never touch a prompt, and the in-process testset above builds
+        # its REPL in a session where `get_extension` happens to work. A gate
+        # that cannot fail is not worth having, and this one fails: against
+        # the unfixed `_replext` it stops at `ajt> ` and reports `pkg> `.
+        if !Sys.isunix()
+            @info "Ajt: skipping the pty take-over gate (needs a Unix pty)"
+        else
+            pts, ptm = try
+                open_fake_pty()
+            catch err
+                @info "Ajt: skipping the pty take-over gate" exception = (err, Any[])
+                nothing, nothing
+            end
+            if ptm !== nothing
+                # Two short lines rather than one long one. A REPL redraws the
+                # whole line on every keystroke, so a 130-character command is
+                # ~17 kB of terminal traffic where these are ~1 kB — and under
+                # the load of a full test run that difference was the
+                # difference between this gate passing and the child dying.
+                #
+                # `__init__` hands the take-over to a task that runs at the
+                # first yield, so the sleep is not a guess about timing: it is
+                # a yield, with two seconds of slack on top.
+                ready = "AJT" * "-READY"     # split so the echoed input cannot match
+                load = "using Ajt\n"
+                settle = "sleep(2); println(\"AJT\" * \"-READY\")\n"
+                # A plain `julia`, deliberately not `Base.julia_cmd()`.
+                #
+                # `julia_cmd()` reproduces *this* process's flags, and under
+                # `Pkg.test` those include `--check-bounds=yes` — which the
+                # sysimage was not built with, so the child re-infers REPL and
+                # Pkg internals on the way to its first prompt. That turned a
+                # 25-second gate into a two-minute one that failed about half
+                # the time. It is also the wrong thing to model: what is being
+                # tested is the REPL a person gets, and a person's REPL has
+                # default flags.
+                julia = joinpath(Sys.BINDIR, Base.julia_exename())
+                project = Base.active_project()
+
+                # Precompile in a child of our own first, with the same flags,
+                # so the very first `using Ajt` inside the pty is not paying
+                # for a cold cache while the clock below is running — which is
+                # exactly how a gate becomes flaky on cold CI.
+                #
+                # Deliberately *only* Ajt. Warming `REPL.load_pkg()` here as
+                # well makes this gate pass far more often, and that is exactly
+                # why it is not done: see the note on `UPSTREAM_CRASH` below.
+                run(pipeline(
+                    `$julia --startup-file=no --history-file=no --project=$project -e "using Ajt"`,
+                    stdout = devnull, stderr = devnull,
+                ))
+
+                cmd = `$julia --startup-file=no --history-file=no --banner=no --project=$project -i`
+                proc = run(detach(cmd), pts, pts, pts; wait = false)
+                Base.close_stdio(pts)
+
+                seen, cursor = Ref(""), Ref(1)
+                reader = @async try
+                    while !eof(ptm)
+                        seen[] *= String(readavailable(ptm))
+                    end
+                catch
+                end
+
+                # Search forward only, so a second `pkg> ` is not satisfied by
+                # the first one still sitting in the transcript.
+                #
+                # Thirty seconds is generous by two orders of magnitude — every
+                # step here takes milliseconds once the caches are warm, and
+                # the whole gate runs in about ten seconds. It is a deadlock
+                # detector, not a budget.
+                function expect(pattern; timeout = 30)
+                    deadline = time() + timeout
+                    while time() < deadline
+                        plain = replace(seen[], r"\e\[[0-9;?]*[a-zA-Z]" => "")
+                        hit = findnext(pattern, plain, min(cursor[], lastindex(plain) + 1))
+                        hit === nothing || (cursor[] = last(hit) + 1; return true)
+                        sleep(0.05)
+                        process_running(proc) || break   # the child died; stop waiting on it
+                    end
+                    # A pty test that fails without showing what the terminal
+                    # actually said is a test nobody can act on.
+                    @info "Ajt: pty gate gave up waiting for $(repr(pattern))" alive =
+                        process_running(proc) transcript =
+                        last(replace(seen[], r"\e\[[0-9;?]*[a-zA-Z]" => ""), 2000)
+                    return false
+                end
+
+                try
+                    # Stop at the first failure. Every later step waits on
+                    # output the dead step was supposed to produce, so carrying
+                    # on turns one timeout into five and buries the real one at
+                    # the top of a very long log.
+                    for (input, pattern, budget) in [
+                            (nothing, "julia> ", 30),
+                            ("]", "pkg> ", 30),   # Pkg's own: Ajt is not loaded yet
+                            ("\x7f", "julia> ", 30),
+                            # Both lines at once: the pty buffers the second
+                            # until the REPL is ready for it. Waiting for a
+                            # `julia> ` in between looks tidier and is not
+                            # sound — the prompt is echoed back as the line is
+                            # typed, so that wait matches before `using Ajt`
+                            # has even started.
+                            #
+                            # This is the one step that can legitimately take
+                            # real time: it contains a `using Ajt` in a fresh
+                            # process. Hence the budget, which is still a
+                            # deadlock detector rather than an expectation.
+                            (load * settle, ready, 180),
+                            ("]", "ajt> ", 30),   # the regression
+                        ]
+                        input === nothing || write(ptm, input)
+                        ok = expect(pattern; timeout = budget)
+                        # A crash in Julia's own loader is not an Ajt failure —
+                        # and it is not this suite's business to hide one
+                        # either, so it fails, loudly and by name.
+                        if !ok && crashed_in_julias_loader(seen[])
+                            @error UPSTREAM_CRASH
+                        end
+                        @test ok
+                        ok || break
+                    end
+                finally
+                    try
+                        write(ptm, "\x7f")
+                        write(ptm, "exit()\n")
+                        wait(Timer(1))
+                    catch
+                    end
+                    kill(proc)
+                    close(ptm)
+                end
+            end
+        end
     end
 
     @testset "delegation" begin
