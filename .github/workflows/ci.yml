@@ -81,10 +81,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-linux-musl, git: true }
-          - { target: aarch64-linux-musl, git: true }
-          - { target: x86_64-macos, git: true }
-          - { target: aarch64-macos, git: true }
+          # `allow-failure` is spelled out on every row, including the false
+          # ones. Left off, the key is absent from those matrix contexts and
+          # `continue-on-error` did not take effect for the row that does set
+          # it — the Windows job failed the whole workflow on the first run.
+          - { target: x86_64-linux-musl, git: true, allow-failure: false }
+          - { target: aarch64-linux-musl, git: true, allow-failure: false }
+          - { target: x86_64-macos, git: true, allow-failure: false }
+          - { target: aarch64-macos, git: true, allow-failure: false }
           # Windows is expected to fail today, and is here to say so out loud
           # rather than by omission. Three call sites in Ajt need porting
           # (`src/julia/treehash.zig` and `src/ops/apps.zig` use
@@ -95,7 +99,7 @@ jobs:
           # last one cannot be fixed from this repository, so this stays
           # non-blocking until the toolchain moves.
           - { target: x86_64-windows-gnu, git: false, allow-failure: true }
-    continue-on-error: ${{ matrix.allow-failure == true }}
+    continue-on-error: ${{ matrix.allow-failure }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2

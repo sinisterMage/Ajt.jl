@@ -698,6 +698,7 @@ end
                 # first yield, so the sleep is not a guess about timing: it is
                 # a yield, with two seconds of slack on top.
                 ready = "AJT" * "-READY"     # split so the echoed input cannot match
+                boot = "println(\"AJT\" * \"-BOOT\")\n"
                 load = "using Ajt\n"
                 settle = "sleep(2); println(\"AJT\" * \"-READY\")\n"
                 # A plain `julia`, deliberately not `Base.julia_cmd()`.
@@ -768,9 +769,18 @@ end
                     # on turns one timeout into five and buries the real one at
                     # the top of a very long log.
                     for (input, pattern, budget) in [
-                            (nothing, "julia> ", 30),
-                            ("]", "pkg> ", 30),   # Pkg's own: Ajt is not loaded yet
-                            ("\x7f", "julia> ", 30),
+                            (nothing, "julia> ", 60),
+                            # A prompt on screen does not mean the line editor
+                            # is listening yet, and on a cold CI runner it is
+                            # not: the first `]` went into a REPL that had not
+                            # finished standing up, and this gate timed out on
+                            # both runners waiting for a `pkg> ` that was never
+                            # going to come. Round-tripping one harmless
+                            # expression proves input is being evaluated before
+                            # anything depends on a keystroke landing.
+                            (boot, "AJT-BOOT", 60),
+                            ("]", "pkg> ", 60),   # Pkg's own: Ajt is not loaded yet
+                            ("\x7f", "julia> ", 60),
                             # Both lines at once: the pty buffers the second
                             # until the REPL is ready for it. Waiting for a
                             # `julia> ` in between looks tidier and is not
@@ -783,7 +793,7 @@ end
                             # process. Hence the budget, which is still a
                             # deadlock detector rather than an expectation.
                             (load * settle, ready, 180),
-                            ("]", "ajt> ", 30),   # the regression
+                            ("]", "ajt> ", 60),   # the regression
                         ]
                         input === nothing || write(ptm, input)
                         ok = expect(pattern; timeout = budget)

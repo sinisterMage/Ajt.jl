@@ -77,17 +77,47 @@ jobs:
           version: '1.12'
 
       # One script builds all four targets, packages both tarball shapes, and
-      # writes the checksums — the same script a maintainer runs before tagging.
-      # `--check` then asserts that the committed `julia/Artifacts.toml`
-      # describes exactly these bytes.
+      # writes the checksums and `julia/Artifacts.toml`.
       #
-      # That check is the whole contract. `Artifacts.toml` records a SHA-256 per
-      # platform and ships inside the registered package, so it has to be
-      # committed before the tag exists; if CI packaged the release by some
-      # other route, `add Ajt` would download a tarball whose hash the package
-      # disagrees with, and it would fail for users rather than here.
-      - name: Build, package, and verify Artifacts.toml
-        run: julia --project=julia packaging/gen_artifacts.jl --check --out dist
+      # It generates rather than verifies, and that is not laziness. Ajt's
+      # binaries embed the absolute path they were built from — the same source
+      # built in two directories differs byte for byte — so a hash produced on a
+      # maintainer's laptop can never match one produced here, and an earlier
+      # version of this job that asserted it did failed on its first run. What
+      # *is* stable is this runner's path, so hashes are reproducible from one
+      # CI run to the next, and the file this job produces is the authoritative
+      # one.
+      - name: Build, package, and write Artifacts.toml
+        run: julia --project=julia packaging/gen_artifacts.jl --out dist
+
+      # `Artifacts.toml` ships *inside* the registered package, so it has to be
+      # committed before the version is registered — and it can only be written
+      # after the binaries exist. That ordering cannot be collapsed, so it is
+      # surfaced instead of hidden: the file is published with the release, and
+      # if the copy in the repository does not already match, the job says so
+      # loudly and tells the maintainer exactly what to do. It does not fail —
+      # the binaries are good, and they are what this tag is for.
+      - name: Compare with the committed Artifacts.toml
+        run: |
+          set -euo pipefail
+          cp julia/Artifacts.toml dist/Artifacts.toml
+          if git diff --quiet -- julia/Artifacts.toml; then
+            echo "### Artifacts.toml is current" >> "$GITHUB_STEP_SUMMARY"
+            echo "The committed file already describes these binaries; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::julia/Artifacts.toml changed — commit it before registering this version"
+            {
+              echo "### Commit the new \`julia/Artifacts.toml\`"
+              echo
+              echo "It is attached to this release, and it describes the binaries this run"
+              echo "published. Register the package only from a commit that contains it,"
+              echo "otherwise \`add Ajt\` resolves to hashes nothing was published under."
+              echo
+              echo '```diff'
+              git diff -- julia/Artifacts.toml | head -100
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

@@ -1497,7 +1497,18 @@ test "a relative cgroup root is read, not silently absolutised" {
     var t = try Tree.init(&root_buf);
     defer t.deinit();
     try t.write("self/cgroup", "0::/\n");
-    try t.write("cgroup/cpu.max", "400000 100000\n");
+    // One CPU, not four. `detect` records a cgroup source only when the quota
+    // is TIGHTER than the affinity count (`detect`, `from_quota < cpu`), so a
+    // four-CPU quota proves nothing on a four-CPU machine -- it leaves
+    // `cpu_source` at `.affinity` while `cpu` coincidentally still reads 4, and
+    // both assertions below would be measuring the host instead of the code.
+    // A GitHub runner has exactly four CPUs, which is how this passed on a
+    // 32-core desktop and failed in CI.
+    try t.write("cgroup/cpu.max", "100000 100000\n");
+
+    // ... and with one CPU there is no quota tighter than the affinity count at
+    // all, so no contents of that file could make this test mean anything.
+    if ((std.Thread.getCpuCount() catch 1) < 2) return error.SkipZigTest;
 
     // The same tree named RELATIVE to the process cwd rather than absolutely.
     // The cwd is not changed -- a test that mutates process-global state is a
@@ -1520,7 +1531,7 @@ test "a relative cgroup root is read, not silently absolutised" {
     // Absolutising `rel_root` would make every read fail, and this module
     // reads a failed read as "no restriction" -- so the bug's signature is
     // `cpu == affinity` with `cpu_source == .affinity`, silently.
-    try testing.expectEqual(@as(u32, 4), m.cpu);
+    try testing.expectEqual(@as(u32, 1), m.cpu);
     try testing.expectEqual(CpuSource.cgroup_v2, m.cpu_source);
 }
 

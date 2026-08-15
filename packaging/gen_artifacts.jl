@@ -7,22 +7,32 @@
 #     julia packaging/gen_artifacts.jl --check         # build, package, verify the file
 #     julia packaging/gen_artifacts.jl --out DIR       # where the tarballs go
 #
-# # One script, so the bytes agree
+# # CI writes the file that ships; a local run cannot
 #
-# The release workflow runs this rather than packaging things itself. That is
-# the point: `Artifacts.toml` records a SHA-256 of a specific tarball, so
-# whatever produces the file that gets published must be the same code that
-# produced the hash, or every release would be a coin toss on whether the two
-# tar implementations agreed byte for byte.
+# `Artifacts.toml` records a SHA-256 per platform, and Ajt's binaries are **not
+# reproducible across build directories** — the same commit built in two
+# different paths differs byte for byte, because the compiler embeds the
+# absolute path it built from. A hash produced on a maintainer's laptop
+# therefore can never match one produced on a runner, and an early version of
+# the release workflow that asserted it did failed on its first tag.
 #
-# # Why the URLs can be written before the release exists
+# What *is* stable is the runner's own path, so hashes are reproducible from one
+# CI run to the next. The release workflow runs this, publishes the tarballs it
+# produced, and attaches the `Artifacts.toml` that describes them. `--check` is
+# then meaningful in exactly one place: comparing a committed file against a
+# rebuild **on the same kind of machine**.
 #
-# An asset's URL is a function of the tag and the file name, both known from
-# `build.zig.zon` alone. So the file is generated, committed, and *then* tagged
-# — which is the order that matters, because the registered version of the
-# package has to contain an `Artifacts.toml`, and the tag that publishes the
-# binaries is the same tag TagBot creates for that version. The release workflow
-# re-runs this with `--check`, so the two cannot drift apart quietly.
+# Running it locally is still useful — it builds and packages every target, and
+# proves the whole pipeline works — but treat the `Artifacts.toml` it leaves
+# behind as a draft, not as the one to ship.
+#
+# # The ordering that cannot be collapsed
+#
+# The registered version of the package must *contain* an `Artifacts.toml`, and
+# that file can only be written once the binaries exist. So: tag, let the
+# release build and publish, commit the `Artifacts.toml` it produced, and
+# register from that commit. URLs are known in advance — they are a function of
+# the tag and the file name — so only the hashes have to wait.
 #
 # # Why two tarballs per target
 #
@@ -213,7 +223,14 @@ function main(args)
             return 0
         end
         println(stderr, "julia/Artifacts.toml does not describe the binaries just built for v$version.")
-        println(stderr, "Run `julia packaging/gen_artifacts.jl` and commit the result.\n")
+        println(
+            stderr, """
+            Commit the version below, taken from a release build. Note that a local
+            build cannot produce matching hashes -- the binaries embed the path they
+            were built from -- so this check only means anything when it runs on the
+            same kind of machine that published the release.
+            """
+        )
         println(stderr, rendered)
         return 1
     end
