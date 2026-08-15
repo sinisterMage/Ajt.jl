@@ -187,14 +187,24 @@ fn buildLibgit2(
         .GIT_RAND_GETENTROPY = !t.os.tag.isDarwin(),
         .GIT_IO_POLL = true,
 
-        // musl 1.2.5 HAS the GNU-signature `qsort_r`, but declares it only
-        // under `_GNU_SOURCE`. Without the declaration, C99 implicit-declaration
-        // rules give a two-argument comparator while libgit2 passes three plus a
-        // payload; the argument registers do not line up and the result is a
-        // SILENTLY WRONG SORT rather than a link error. `-D_GNU_SOURCE` is on
-        // every file below for exactly this, and `git_vector_sort` is covered by
-        // a 10k-element test in `src/git/c.zig`.
-        .GIT_QSORT_GNU = true,
+        // Which `qsort_r` this platform has, and they are not compatible.
+        //
+        // glibc and musl take `(base, nel, width, compar, thunk)`; Apple's
+        // takes `(base, nel, width, thunk, compar)` -- the last two swapped.
+        // libgit2 has a prong for each (`src/util/util.c:725-740`), and picking
+        // the wrong one does not fail to link: the comparator pointer arrives
+        // where the payload was expected, and the result is a SILENTLY WRONG
+        // SORT. Claiming GNU on macOS is exactly that mistake, and the
+        // 10k-element `git_vector_sort` test in `src/git/c.zig` is what caught
+        // it.
+        //
+        // The musl half has a second trap. It HAS the GNU signature but
+        // declares it only under `_GNU_SOURCE`; without the declaration, C99
+        // implicit-declaration rules give a two-argument comparator while
+        // libgit2 passes three plus a payload, and the registers do not line
+        // up. `-D_GNU_SOURCE` is on every file below for that.
+        .GIT_QSORT_GNU = !t.os.tag.isDarwin(),
+        .GIT_QSORT_BSD = t.os.tag.isDarwin(),
     });
 
     // Bundled PCRE 8.x. Note the `@NEWLINE@`-style substitutions alongside the

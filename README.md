@@ -172,7 +172,7 @@ A prebuilt binary, from the [latest release](https://github.com/sinisterMage/Ajt
 | | |
 |---|---|
 | Linux | `ajt-<version>-x86_64-linux-musl.tar.gz` · `…-aarch64-linux-musl.tar.gz` |
-| macOS | `ajt-<version>-aarch64-macos.tar.gz` · `…-x86_64-macos.tar.gz` |
+| macOS | `ajt-<version>-aarch64-macos.tar.gz`  |
 | Windows | `ajt-<version>-x86_64-windows-gnu.tar.gz` |
 
 Each holds `bin/ajt` and the licences it owes. The Linux builds are static musl

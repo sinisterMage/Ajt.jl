@@ -83,7 +83,8 @@ jobs:
         include:
           - { target: x86_64-linux-musl, runner: ubuntu-latest, git: true }
           - { target: aarch64-linux-musl, runner: ubuntu-24.04-arm, git: true }
-          - { target: x86_64-macos, runner: macos-13, git: true }
+          # No Intel macOS: `macos-13` is the last x86_64 image and is being
+          # retired. Rosetta 2 covers what is left.
           - { target: aarch64-macos, runner: macos-14, git: true }
           # libgit2 is off here because `buildLibgit2` compiles its
           # `src/util/unix` and there is no `src/util/win32` in that list. The

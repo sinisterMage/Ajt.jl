@@ -74,7 +74,9 @@ jobs:
         include:
           - { target: x86_64-linux-musl, runner: ubuntu-latest }
           - { target: aarch64-linux-musl, runner: ubuntu-24.04-arm }
-          - { target: x86_64-macos, runner: macos-13 }
+          # No Intel macOS. `macos-13` is the last x86_64 image, it is going
+          # away, and a release queued behind it never got a runner at all.
+          # Rosetta 2 covers the Intel machines that remain.
           - { target: aarch64-macos, runner: macos-14 }
           - { target: x86_64-windows-gnu, runner: windows-latest }
     steps:

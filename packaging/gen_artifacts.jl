@@ -71,6 +71,11 @@ libgit2's `src/util/unix` and there is no `src/util/win32` in that list, so the
 libgit2 backend cannot link there yet. Ajt's default git backend is the `git`
 CLI on every platform, so a Windows build is fully functional — it just cannot
 be switched to `AJT_GIT_BACKEND=lib`.
+
+Intel macOS is absent. GitHub's `macos-13` is the last x86_64 image and is on
+its way out — a release queued behind it simply never got a runner — and Apple
+is ending Intel support regardless. Rosetta 2 runs the aarch64 binary on the
+few Intel machines left.
 """
 const TARGETS = [
     (zig = "x86_64-linux-musl", runner = "ubuntu-latest", git = true, exe = "ajt",
@@ -79,8 +84,6 @@ const TARGETS = [
     (zig = "aarch64-linux-musl", runner = "ubuntu-24.04-arm", git = true, exe = "ajt",
         platforms = [(os = "linux", arch = "aarch64", libc = "glibc"),
                      (os = "linux", arch = "aarch64", libc = "musl")]),
-    (zig = "x86_64-macos", runner = "macos-13", git = true, exe = "ajt",
-        platforms = [(os = "macos", arch = "x86_64", libc = nothing)]),
     (zig = "aarch64-macos", runner = "macos-14", git = true, exe = "ajt",
         platforms = [(os = "macos", arch = "aarch64", libc = nothing)]),
     (zig = "x86_64-windows-gnu", runner = "windows-latest", git = false, exe = "ajt.exe",

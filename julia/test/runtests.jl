@@ -694,13 +694,21 @@ end
                 # the load of a full test run that difference was the
                 # difference between this gate passing and the child dying.
                 #
-                # `__init__` hands the take-over to a task that runs at the
-                # first yield, so the sleep is not a guess about timing: it is
-                # a yield, with two seconds of slack on top.
+                # `__init__` hands the take-over to a task, so the next line
+                # waits for the task to have *done* it rather than for a
+                # duration. A flat `sleep(2)` stood here and was long enough on
+                # every developer machine and not on a cold macOS runner, where
+                # this gate then failed at the last step with the child alive
+                # and well — the most confusing way it could possibly fail.
+                #
+                # If the take-over never happens the wait runs to the budget
+                # below and fails, which is the right answer rather than a
+                # missing one.
                 ready = "AJT" * "-READY"     # split so the echoed input cannot match
                 boot = "println(\"AJT\" * \"-BOOT\")\n"
                 load = "using Ajt\n"
-                settle = "sleep(2); println(\"AJT\" * \"-READY\")\n"
+                settle = "while isempty(Ajt.REPLMode._PATCHED); sleep(0.1); end; " *
+                    "println(\"AJT\" * \"-READY\")\n"
                 # A plain `julia`, deliberately not `Base.julia_cmd()`.
                 #
                 # `julia_cmd()` reproduces *this* process's flags, and under
@@ -766,10 +774,14 @@ end
                         process_running(proc) || break   # the child died; stop waiting on it
                     end
                     # A pty test that fails without showing what the terminal
-                    # actually said is a test nobody can act on.
-                    @info "Ajt: pty gate gave up waiting for $(repr(pattern))" alive =
-                        process_running(proc) transcript =
-                        last(replace(seen[], r"\e\[[0-9;?]*[a-zA-Z]" => ""), 2000)
+                    # actually said is a test nobody can act on — and `@info`
+                    # elides the middle of a long string, which is exactly
+                    # where a crash dump's top frames are. Printed instead.
+                    println(stderr, "\nAjt: pty gate gave up waiting for ", repr(pattern),
+                        " (child alive: ", process_running(proc), ")")
+                    println(stderr, "---- transcript ----")
+                    println(stderr, replace(seen[], r"\e\[[0-9;?]*[a-zA-Z]" => ""))
+                    println(stderr, "--------------------")
                     return false
                 end
 
