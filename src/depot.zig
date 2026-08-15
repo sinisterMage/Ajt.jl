@@ -44,6 +44,7 @@
 //! `toml/` and `registry/` are pure or read-only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const fspath = std.fs.path;
@@ -1001,14 +1002,51 @@ pub fn setReadonly(gpa: Allocator, io: Io, dir: Io.Dir) SetReadonlyError!void {
 
         // Already read-only: skip the chmod. Re-running set_readonly over a
         // warm tree is then free instead of one inode write per file.
-        if (st.permissions.readOnly()) continue;
+        if (readonly.get(st.permissions)) continue;
 
-        entry.dir.setFilePermissions(io, entry.basename, st.permissions.setReadOnly(true), .{}) catch |err| switch (err) {
+        entry.dir.setFilePermissions(io, entry.basename, readonly.set(st.permissions, true), .{}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {},
         };
     }
 }
+
+/// `Permissions.readOnly`/`setReadOnly`, including on the platform where std's
+/// own versions do not compile.
+///
+/// Zig 0.16.0 migrated `windows.FILE.ATTRIBUTE` to a `packed struct(ULONG)`
+/// with a `READONLY` field, but left `std/Io/File.zig:349-360` reading the
+/// integer constant `windows.FILE_ATTRIBUTE_READONLY` that the migration
+/// deleted. Calling either method therefore fails to compile for Windows --
+/// inside std, with Ajt only in the reference trace.
+///
+/// Not worked around by skipping: marking installed packages read-only is
+/// Pkg's `set_readonly`, Julia sets the same attribute on Windows, and a depot
+/// that silently stopped protecting its packages there would be a real
+/// regression. These do the same bit through the struct that replaced the
+/// constant, and the comptime branch means std's broken version is never
+/// analysed. Delete both when upstream compiles.
+///
+/// `pub` because `cache/store.zig` asserts on the same bit and would otherwise
+/// carry a second copy of the same workaround.
+pub const readonly = struct {
+    const windows = @import("builtin").os.tag == .windows;
+
+    pub fn get(p: Io.File.Permissions) bool {
+        return if (comptime windows) blk: {
+            const a: std.os.windows.FILE.ATTRIBUTE = @bitCast(@intFromEnum(p));
+            break :blk a.READONLY;
+        } else p.readOnly();
+    }
+
+    pub fn set(p: Io.File.Permissions, value: bool) Io.File.Permissions {
+        return if (comptime windows) blk: {
+            var a: std.os.windows.FILE.ATTRIBUTE = @bitCast(@intFromEnum(p));
+            a.READONLY = value;
+            break :blk @enumFromInt(@as(std.os.windows.DWORD, @bitCast(a)));
+        } else p.setReadOnly(value);
+    }
+};
 
 /// `setReadonly` on a path. Opens and closes the directory itself.
 pub fn setReadonlyPath(gpa: Allocator, io: Io, dir_path: []const u8) SetReadonlyError!void {
@@ -1210,7 +1248,9 @@ fn makeDirWritable(io: Io, parent: Io.Dir, sub_path: []const u8) !void {
     const wanted: Perms = if (@hasDecl(Perms, "toMode"))
         .fromMode(st.permissions.toMode() | 0o333)
     else
-        st.permissions.setReadOnly(false);
+        // `readonly.set`, not `st.permissions.setReadOnly` -- the branch this
+        // takes is the Windows one, where std's own method does not compile.
+        readonly.set(st.permissions, false);
     if (wanted == st.permissions) return;
     try parent.setFilePermissions(io, sub_path, wanted, .{});
 }
@@ -1518,13 +1558,13 @@ test "atomic install lands at the destination and applies the mode rule" {
         "packages/StaticArrays/0cEwi/Project.toml",
         "packages/StaticArrays/0cEwi/src/StaticArrays.jl",
     }) |f| {
-        try testing.expect((try tmp.dir.statFile(io, f, .{})).permissions.readOnly());
+        try testing.expect(readonly.get((try tmp.dir.statFile(io, f, .{})).permissions));
     }
     for ([_][]const u8{
         "packages/StaticArrays/0cEwi",
         "packages/StaticArrays/0cEwi/src",
     }) |sub| {
-        try testing.expect(!(try tmp.dir.statFile(io, sub, .{})).permissions.readOnly());
+        try testing.expect(!readonly.get((try tmp.dir.statFile(io, sub, .{})).permissions));
     }
 
     try expectSoleEntry(io, tmp.dir, "packages/StaticArrays");
@@ -1554,7 +1594,7 @@ test "commit can publish without making the tree read-only" {
     }));
 
     const f = try tmp.dir.statFile(io, "registries/General/Registry.toml", .{});
-    try testing.expect(!f.permissions.readOnly());
+    try testing.expect(!readonly.get(f.permissions));
 }
 
 test "losing the install race reports success and cleans up" {
@@ -1634,16 +1674,16 @@ test "set_readonly leaves symlinks and directories alone" {
     const tree_len = try tmp.dir.realPathFile(io, "tree", &tree_buf);
     try setReadonlyPath(testing.allocator, io, tree_buf[0..tree_len]);
 
-    try testing.expect((try tmp.dir.statFile(io, "tree/target.txt", .{})).permissions.readOnly());
-    try testing.expect((try tmp.dir.statFile(io, "tree/sub/deep.txt", .{})).permissions.readOnly());
-    try testing.expect(!(try tmp.dir.statFile(io, "tree/sub", .{})).permissions.readOnly());
+    try testing.expect(readonly.get((try tmp.dir.statFile(io, "tree/target.txt", .{})).permissions));
+    try testing.expect(readonly.get((try tmp.dir.statFile(io, "tree/sub/deep.txt", .{})).permissions));
+    try testing.expect(!readonly.get((try tmp.dir.statFile(io, "tree/sub", .{})).permissions));
 
     if (can_symlink) {
         // The link itself was not chmod'ed: its own (lstat) mode still has the
         // write bits, which is how a symlink is always created.
         const l = try tmp.dir.statFile(io, "tree/link.txt", .{ .follow_symlinks = false });
         try testing.expectEqual(Io.File.Kind.sym_link, l.kind);
-        try testing.expect(!l.permissions.readOnly());
+        try testing.expect(!readonly.get(l.permissions));
     }
 }
 
@@ -1708,6 +1748,10 @@ test "enumeration reports what a sweep would consider, and nothing else" {
 }
 
 test "removeTree undoes set_readonly, which nothing else can" {
+    // set_readonly is a POSIX mode here; the Windows attribute path is
+    // exercised by `readonly.set`, and `Permissions.fromMode` does not exist
+    // there at all. Comptime, so the body below is not analysed either.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

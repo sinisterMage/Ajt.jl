@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -74,40 +74,39 @@ jobs:
       # suite in which every libgit2 test was compiled out.
       - run: zig build test-git -Dgit
 
-  cross:
-    name: cross-compile ${{ matrix.target }}
-    runs-on: ubuntu-latest
+  release-targets:
+    name: build ${{ matrix.target }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # `allow-failure` is spelled out on every row, including the false
-          # ones. Left off, the key is absent from those matrix contexts and
-          # `continue-on-error` did not take effect for the row that does set
-          # it — the Windows job failed the whole workflow on the first run.
-          - { target: x86_64-linux-musl, git: true, allow-failure: false }
-          - { target: aarch64-linux-musl, git: true, allow-failure: false }
-          - { target: x86_64-macos, git: true, allow-failure: false }
-          - { target: aarch64-macos, git: true, allow-failure: false }
-          # Windows is expected to fail today, and is here to say so out loud
-          # rather than by omission. Three call sites in Ajt need porting
-          # (`src/julia/treehash.zig` and `src/ops/apps.zig` use
-          # `Io.File.Permissions.{to,from}Mode`, which the Windows variant does
-          # not have; `src/ops/test.zig` names `SIG.HUP`) and a fourth failure
-          # is upstream: Zig 0.16.0's own `std/Io/File.zig` references
-          # `os.windows.FILE_ATTRIBUTE_READONLY`, which does not exist. That
-          # last one cannot be fixed from this repository, so this stays
-          # non-blocking until the toolchain moves.
-          - { target: x86_64-windows-gnu, git: false, allow-failure: true }
-    continue-on-error: ${{ matrix.allow-failure }}
+          - { target: x86_64-linux-musl, runner: ubuntu-latest, git: true }
+          - { target: aarch64-linux-musl, runner: ubuntu-24.04-arm, git: true }
+          - { target: x86_64-macos, runner: macos-13, git: true }
+          - { target: aarch64-macos, runner: macos-14, git: true }
+          # libgit2 is off here because `buildLibgit2` compiles its
+          # `src/util/unix` and there is no `src/util/win32` in that list. The
+          # binary is fully functional without it — Ajt's default git backend is
+          # the `git` CLI on every platform — it just cannot be switched to
+          # `AJT_GIT_BACKEND=lib`.
+          - { target: x86_64-windows-gnu, runner: windows-latest, git: false }
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      # Every target a release publishes gets built on every pull request, so a
-      # tag is never the first time anyone tried.
-      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast ${{ matrix.git && '-Dgit' || '' }}
+      # Every target a release publishes is built on every pull request, on the
+      # same runner the release will use — so a tag is never the first time
+      # anyone tried, on any platform.
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast ${{ matrix.git && '-Dgit' || '' }} --prefix out
+      # And run it, which is the part cross-compiling could never do.
+      - shell: bash
+        run: |
+          bin=out/bin/ajt
+          [ -f "$bin" ] || bin=out/bin/ajt.exe
+          "$bin" version
+          "$bin" help > /dev/null
 
   julia:
     name: wrapper tests (${{ matrix.os }})

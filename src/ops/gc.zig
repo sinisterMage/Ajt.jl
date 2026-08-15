@@ -61,6 +61,7 @@
 //! `markManifestRepos`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const fspath = std.fs.path;
@@ -1502,6 +1503,9 @@ test "a malformed Artifacts.toml collects nothing" {
 }
 
 test "a depot whose logs/ cannot be written collects nothing" {
+    // Makes a directory unwritable by mode, which is not how Windows denies
+    // access -- and `Permissions.fromMode` does not exist there.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     var f = try Fixture.init(io);
     defer f.deinit();

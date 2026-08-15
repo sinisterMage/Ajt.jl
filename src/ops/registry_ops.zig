@@ -2276,7 +2276,11 @@ test "the unpacked layout extracts, stamps .tree_info.toml and stays writable" {
 
     // Pkg keeps registries/ WRITABLE -- that is what lets `update` rewrite it
     // in place -- unlike packages/ and artifacts/.
-    try testing.expect(!(try tmp.dir.statFile(io, "registries/General/Registry.toml", .{})).permissions.readOnly());
+    // `depot_mod.readonly.get`, not `.readOnly()`: std's own accessor does not
+    // compile for Windows, and "stays writable" is asserted there too.
+    try testing.expect(!depot_mod.readonly.get(
+        (try tmp.dir.statFile(io, "registries/General/Registry.toml", .{})).permissions,
+    ));
     // No stamp file: a directory and a stamp for the same name must not
     // coexist.
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "registries/General.toml", .{}));

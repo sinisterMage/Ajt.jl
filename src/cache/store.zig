@@ -1540,7 +1540,10 @@ test "an object round-trips: PUT names it by its hash, GET verifies and extracts
         try std.fs.path.join(arena, &.{ dest, "Example", "abcde.ji" }),
         .{},
     );
-    try testing.expect(!st.permissions.readOnly());
+    // `depot_mod.readonly.get`, not `st.permissions.readOnly()`: std's own
+    // accessor does not compile for Windows, and this assertion is not
+    // POSIX-specific — an extracted object must be writable there too.
+    try testing.expect(!depot_mod.readonly.get(st.permissions));
     // No staging leftovers beside it.
     try testing.expectEqual(@as(usize, 1), try dirEntries(io, tmp.dir, "compiled"));
 }

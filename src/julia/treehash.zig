@@ -32,6 +32,7 @@
 //! OWNER execute bit only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha1 = std.crypto.hash.Sha1;
@@ -176,8 +177,18 @@ fn hashDirInner(gpa: Allocator, io: Io, dir: Io.Dir) Error!?Hash {
                 const data = dir.readFileAlloc(io, name, arena, .limited(1 << 30)) catch
                     return error.ReadFailed;
                 const st = dir.statFile(io, name, .{}) catch return error.ReadFailed;
-                const mode_bits = st.permissions.toMode();
-                const mode: Mode = if (mode_bits & 0o100 != 0) .exec else .file;
+                // Windows has no executable bit, and git does not invent one:
+                // every regular file in a tree there hashes as `100644`, which
+                // is what makes a tree hash agree across platforms in the first
+                // place. `Permissions.toMode` does not exist on that target
+                // either, so this is a comptime branch rather than a runtime
+                // guard -- the `else` is never analysed on Windows.
+                const mode: Mode = if (comptime builtin.os.tag == .windows)
+                    .file
+                else if (st.permissions.toMode() & 0o100 != 0)
+                    .exec
+                else
+                    .file;
                 try entries.append(arena, .{
                     .name = name,
                     .mode = mode,

@@ -1619,9 +1619,17 @@ test "disk space and the admission watermark" {
     var t = try Tree.init(&root_buf);
     defer t.deinit();
 
-    const space = try diskSpace(t.root);
-    try testing.expect(space.total_bytes > 0);
-    try testing.expect(space.avail_bytes <= space.total_bytes);
+    // `diskSpace` is Linux-only by construction -- Zig 0.16's `std.Io` exposes
+    // no `statfs` and the other prong declines rather than guessing -- so the
+    // real reading is asserted only where there is one, and asserted strictly
+    // there: a directory this test just created cannot be `Unsupported` on a
+    // platform that has `statfs`. An unguarded `try` failed the whole test on
+    // macOS, taking the platform-independent half below with it.
+    if (native_os == .linux) {
+        const space = try diskSpace(t.root);
+        try testing.expect(space.total_bytes > 0);
+        try testing.expect(space.avail_bytes <= space.total_bytes);
+    }
 
     // The artifact set this is sized against, against a synthetic filesystem.
     const fake: Space = .{ .total_bytes = 2 * GiB, .avail_bytes = 600 * MiB };

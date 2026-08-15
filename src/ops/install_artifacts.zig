@@ -1038,7 +1038,7 @@ test "the Pkg server is tried first, and its tarball installs atomically" {
     try testing.expectEqualStrings(fx.hash_hex, &treehash.toHex(on_disk));
     // Content-addressed, so it is published read-only (`Artifacts.jl:88`).
     const st = try Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ installed, "README.md" }), .{});
-    try testing.expect(st.permissions.readOnly());
+    try testing.expect(depot_mod.readonly.get(st.permissions));
     // No staging leftovers.
     try testing.expectEqual(@as(usize, 1), try fx.artifactEntries(io));
 

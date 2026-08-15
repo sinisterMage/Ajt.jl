@@ -1753,8 +1753,8 @@ test "install downloads, verifies and publishes, and is a no-op the second time"
         results[0].path,
     );
     const entry_file = try std.fmt.allocPrint(arena, "{s}/src/Demo.jl", .{rel});
-    try testing.expect((try tmp.dir.statFile(io, entry_file, .{})).permissions.readOnly());
-    try testing.expect(!(try tmp.dir.statFile(io, rel, .{})).permissions.readOnly());
+    try testing.expect(depot.readonly.get((try tmp.dir.statFile(io, entry_file, .{})).permissions));
+    try testing.expect(!depot.readonly.get((try tmp.dir.statFile(io, rel, .{})).permissions));
     const body = try tmp.dir.readFileAlloc(io, entry_file, arena, .limited(256));
     try testing.expectEqualStrings("module Demo end\n", body);
 
@@ -2075,8 +2075,8 @@ test "a package with no archive is cloned, re-hashed and published" {
     );
     // ...with `set_readonly`'s mode rule, exactly as the archive path leaves
     // it (`Operations.jl:1235`).
-    try testing.expect((try tmp.dir.statFile(io, entry_file, .{})).permissions.readOnly());
-    try testing.expect(!(try tmp.dir.statFile(io, rel, .{})).permissions.readOnly());
+    try testing.expect(depot.readonly.get((try tmp.dir.statFile(io, entry_file, .{})).permissions));
+    try testing.expect(!depot.readonly.get((try tmp.dir.statFile(io, rel, .{})).permissions));
     // ...and no staging directory survived.
     var pkg_dir = try tmp.dir.openDir(io, "packages/Demo", .{ .iterate = true });
     defer pkg_dir.close(io);

@@ -82,6 +82,7 @@
 //! reproduced; `ajt` has no workspace support anywhere.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const fspath = std.fs.path;
@@ -764,6 +765,13 @@ fn appendReason(arena: Allocator, buf: *std.ArrayList(u8), r: *const Run) Alloca
 /// else. `Base.SIGHUP` and friends are the only ones Pkg spells out, so a
 /// suite killed by `SIGSEGV` reports `11` on both sides.
 fn signalName(arena: Allocator, s: std.posix.SIG) Allocator.Error![]const u8 {
+    // Windows has no `SIGHUP` -- `std.posix.SIG` there is a different set
+    // entirely, and naming a member it does not have is a compile error rather
+    // than a dead branch. A Windows child is not signalled either, so the
+    // numeric fallback is the whole of the answer there.
+    if (comptime builtin.os.tag == .windows) {
+        return try std.fmt.allocPrint(arena, "{d}", .{@intFromEnum(s)});
+    }
     return switch (s) {
         .HUP => "HUP",
         .INT => "INT",
@@ -1002,6 +1010,8 @@ test "resolveSpec refuses a name two manifest entries share" {
 }
 
 test "the failure messages Pkg raises" {
+    // Names POSIX signals; `std.posix.SIG` on Windows is a different set.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

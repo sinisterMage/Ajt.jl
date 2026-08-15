@@ -1,12 +1,15 @@
 # Cut a release from a `v<version>` tag.
 #
-# Everything is cross-compiled from one Linux runner, because that is what Zig
-# is for: `zig build -Dtarget=…` produces the macOS and Linux binaries from the
-# same machine, libgit2 included, with no per-OS build farm and no chance of two
-# platforms being built from different states of the tree.
+# Every binary is built on a runner of its own platform: the macOS builds on
+# macOS, the aarch64 Linux build on an aarch64 runner, the Windows build on
+# Windows. Zig could cross-compile the lot from one machine in a third of the
+# wall clock, and an earlier version of this file did — but then nothing is ever
+# *run* before it is published, and "it linked" is a much weaker claim than "it
+# printed its version on the machine it was built for". The jobs run in
+# parallel, so the honest way is not the slow way.
 #
-# Native runners still appear, but only to *run* what was built. A release that
-# ships a binary nobody executed is not a release.
+# Windows is a first-class target here. Julia's users are Windows users more
+# often than not.
 
 name: Release
 
@@ -62,9 +65,18 @@ jobs:
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
 
   build:
-    name: build and package every target
+    name: ${{ matrix.target }} on ${{ matrix.runner }}
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-musl, runner: ubuntu-latest }
+          - { target: aarch64-linux-musl, runner: ubuntu-24.04-arm }
+          - { target: x86_64-macos, runner: macos-13 }
+          - { target: aarch64-macos, runner: macos-14 }
+          - { target: x86_64-windows-gnu, runner: windows-latest }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,82 +88,26 @@ jobs:
         with:
           version: '1.12'
 
-      # One script builds all four targets, packages both tarball shapes, and
-      # writes the checksums and `julia/Artifacts.toml`.
-      #
-      # It generates rather than verifies, and that is not laziness. Ajt's
-      # binaries embed the absolute path they were built from — the same source
-      # built in two directories differs byte for byte — so a hash produced on a
-      # maintainer's laptop can never match one produced here, and an earlier
-      # version of this job that asserted it did failed on its first run. What
-      # *is* stable is this runner's path, so hashes are reproducible from one
-      # CI run to the next, and the file this job produces is the authoritative
-      # one.
-      - name: Build, package, and write Artifacts.toml
-        run: julia --project=julia packaging/gen_artifacts.jl --out dist
+      # One target, packaged both ways, with a `<target>.hashes` fragment for
+      # the assemble job. The script decides which targets link libgit2 and
+      # which licences travel with them.
+      - name: Build and package
+        run: julia --project=julia packaging/gen_artifacts.jl --target ${{ matrix.target }} --out dist
 
-      # `Artifacts.toml` ships *inside* the registered package, so it has to be
-      # committed before the version is registered — and it can only be written
-      # after the binaries exist. That ordering cannot be collapsed, so it is
-      # surfaced instead of hidden: the file is published with the release, and
-      # if the copy in the repository does not already match, the job says so
-      # loudly and tells the maintainer exactly what to do. It does not fail —
-      # the binaries are good, and they are what this tag is for.
-      - name: Compare with the committed Artifacts.toml
-        run: |
-          set -euo pipefail
-          cp julia/Artifacts.toml dist/Artifacts.toml
-          if git diff --quiet -- julia/Artifacts.toml; then
-            echo "### Artifacts.toml is current" >> "$GITHUB_STEP_SUMMARY"
-            echo "The committed file already describes these binaries; nothing to do." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::julia/Artifacts.toml changed — commit it before registering this version"
-            {
-              echo "### Commit the new \`julia/Artifacts.toml\`"
-              echo
-              echo "It is attached to this release, and it describes the binaries this run"
-              echo "published. Register the package only from a commit that contains it,"
-              echo "otherwise \`add Ajt\` resolves to hashes nothing was published under."
-              echo
-              echo '```diff'
-              git diff -- julia/Artifacts.toml | head -100
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
-
-  smoke:
-    name: run it on ${{ matrix.runner }}
-    needs: [version, build]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: ubuntu-latest, target: x86_64-linux-musl }
-          - { runner: ubuntu-24.04-arm, target: aarch64-linux-musl }
-          - { runner: macos-14, target: aarch64-macos }
-          - { runner: macos-13, target: x86_64-macos }
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-      # Unpack exactly what a user would download, and run it. This is the only
-      # step that proves the cross-compiled binary is executable on the machine
-      # it was built for, rather than merely well-formed.
-      - name: Unpack and run
+      # The point of building here rather than cross-compiling: unpack exactly
+      # what a user would download, on the platform they would download it for,
+      # and run it.
+      - name: Unpack and run it
+        shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          tar -xzf "dist/ajt-$VERSION-${{ matrix.target }}.tar.gz"
-          bin="ajt-$VERSION-${{ matrix.target }}/bin/ajt"
+          tar -xzf "dist/ajt-$VERSION-$TARGET.tar.gz"
+          dir="ajt-$VERSION-$TARGET"
+          bin="$dir/bin/ajt"
+          [ -f "$bin" ] || bin="$dir/bin/ajt.exe"
           "$bin" help > /dev/null
           printed=$("$bin" version)
           echo "$printed"
@@ -159,34 +115,80 @@ jobs:
             echo "::error::ajt version printed '$printed', expected 'ajt $VERSION'"
             exit 1
           fi
-          # The licence that has to travel with a statically linked libgit2.
-          test -f "ajt-$VERSION-${{ matrix.target }}/share/licenses/Ajt/LICENSE.libgit2"
+          test -f "$dir/share/licenses/Ajt/LICENSE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
 
   publish:
-    name: publish the release
-    needs: [version, build, smoke]
+    name: assemble and publish
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
       - uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: staging
-      - run: ls -l staging
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      # The fragments each runner produced become one `Artifacts.toml`. No
+      # binary is built here — this job only reads hashes the builders computed
+      # from the bytes they are about to publish.
+      - name: Assemble Artifacts.toml
+        run: julia --project=julia packaging/gen_artifacts.jl --assemble --out dist
+
+      # `Artifacts.toml` ships *inside* the registered package, so it has to be
+      # committed before the version is registered — and it can only be written
+      # after the binaries exist. That ordering cannot be collapsed, so it is
+      # surfaced rather than hidden: the file is published with the release, and
+      # if the copy in the repository does not already match, the job says so
+      # and shows the diff. It does not fail; the binaries are good, and they
+      # are what this tag is for.
+      - name: Report Artifacts.toml
+        run: |
+          set -euo pipefail
+          cp julia/Artifacts.toml dist/Artifacts.toml
+          if git diff --quiet -- julia/Artifacts.toml; then
+            echo "### Artifacts.toml is current" >> "$GITHUB_STEP_SUMMARY"
+            echo "The committed file already describes these binaries." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::julia/Artifacts.toml changed — commit it before registering this version"
+            {
+              echo "### Commit the new \`julia/Artifacts.toml\`"
+              echo
+              echo "It is attached to this release and describes the binaries just published."
+              echo "Register only from a commit that contains it, or \`add Ajt\` resolves to"
+              echo "hashes nothing was published under."
+              echo
+              echo '```diff'
+              git diff -- julia/Artifacts.toml | head -120
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          rm -f dist/*.hashes
+          ls -l dist
           # Idempotent on re-run: a release that already exists gets its assets
           # replaced rather than a second release appearing next to it.
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" staging/* --clobber
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" staging/* \
+            gh release create "$TAG" dist/* \
               --title "ajt $TAG" \
               --generate-notes
           fi

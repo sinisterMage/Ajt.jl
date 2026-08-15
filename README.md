@@ -173,13 +173,17 @@ A prebuilt binary, from the [latest release](https://github.com/sinisterMage/Ajt
 |---|---|
 | Linux | `ajt-<version>-x86_64-linux-musl.tar.gz` · `…-aarch64-linux-musl.tar.gz` |
 | macOS | `ajt-<version>-aarch64-macos.tar.gz` · `…-x86_64-macos.tar.gz` |
+| Windows | `ajt-<version>-x86_64-windows-gnu.tar.gz` |
 
-The Linux builds are static musl binaries with no shared-library dependency at
-all; every build links libgit2 statically, so nothing needs installing beside
-them. Each asset's SHA-256 is in `SHA256SUMS` on the release. Put `ajt` anywhere
-on `PATH`.
+Each holds `bin/ajt` and the licences it owes. The Linux builds are static musl
+binaries with no shared-library dependency at all. Every asset is built on a
+runner of its own platform and run there before release, and its SHA-256 is in
+`SHA256SUMS`. Put `ajt` anywhere on `PATH`.
 
-Windows is not built yet — see *Building* below for exactly what is missing.
+The Linux and macOS builds link libgit2 statically. The Windows build does not
+— `buildLibgit2` compiles libgit2's `src/util/unix` and has no `src/util/win32`
+yet — so on Windows the `AJT_GIT_BACKEND=lib` backend is unavailable. Nothing
+else differs: the `git` CLI backend is the default everywhere.
 
 ### Building
 
@@ -192,16 +196,17 @@ zig build -Dgit        # ... with the libgit2 backend (fetches ~30 MB of C)
 ajt help               # every command and flag
 ```
 
-Cross-compiling is `zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast`;
-that is how the releases are built, all of them from one Linux machine.
+Cross-compiling works — `zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast`
+— and `packaging/gen_artifacts.jl` will build every release target from one
+machine. Releases themselves do not: each binary is built on a runner of its own
+platform so that it can be *run* before it is published.
 
-Windows does not compile today. Three call sites need porting —
-`src/julia/treehash.zig` and `src/ops/apps.zig` reach for
-`Io.File.Permissions.{to,from}Mode`, which the Windows variant does not have,
-and `src/ops/test.zig` names `SIG.HUP` — and a fourth failure is upstream, in
-Zig 0.16.0's own `std/Io/File.zig`, which references
-`os.windows.FILE_ATTRIBUTE_READONLY`. That one cannot be fixed from here, so the
-target stays non-blocking in CI until the toolchain moves.
+One Windows note for anyone reading `src/depot.zig`: `readonly.get`/`readonly.set`
+exist because Zig 0.16.0's `std/Io/File.zig:349-360` still reads the integer
+constant `windows.FILE_ATTRIBUTE_READONLY` that the migration to
+`packed struct(ULONG)` deleted, so std's own `readOnly`/`setReadOnly` do not
+compile for Windows. Ajt does the same bit through the struct that replaced it.
+Delete both when upstream compiles.
 
 ## Commands
 

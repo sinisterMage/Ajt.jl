@@ -33,6 +33,7 @@
 //! many of these to run at once.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const http = std.http;
@@ -1362,6 +1363,8 @@ test "the bearer token reaches the server and is dropped on a cross-origin redir
 }
 
 test "an expiring token is refreshed before use and written back" {
+    // Asserts the 0o600 the token file is written with, which is a POSIX mode.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

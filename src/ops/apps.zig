@@ -88,6 +88,7 @@
 //! are `entryfile` and `[sources]`, both of which already have mutators.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -712,8 +713,16 @@ pub fn writeShims(
             // `Sys.isunix() && chmod(julia_bin_filename, 0o755)` (`:510-512`).
             // A shim nobody can execute is the same as no shim at all, and the
             // failure surfaces far from here.
+            //
+            // The inner test is comptime and the outer one is not, and both are
+            // needed. `opts.target` is a *request* -- a caller may ask for posix
+            // shims anywhere -- while `Permissions.fromMode` simply does not
+            // exist on a Windows build, so the call has to be compiled out
+            // rather than skipped.
             if (opts.target == .posix) {
-                try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o755), .{});
+                if (comptime builtin.os.tag != .windows) {
+                    try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o755), .{});
+                }
             }
         }
         try changes.append(arena, .{
@@ -1512,6 +1521,8 @@ const Fixture = struct {
 };
 
 test "app dev installs shims against the working tree and records no app environment" {
+    // Checks the 0o755 on a posix shim; Windows gets a `.bat` and no mode.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var a = std.heap.ArenaAllocator.init(testing.allocator);
     defer a.deinit();
     const g = a.allocator();

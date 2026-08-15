@@ -727,7 +727,17 @@ end
                     stdout = devnull, stderr = devnull,
                 ))
 
-                cmd = `$julia --startup-file=no --history-file=no --banner=no --project=$project -i`
+                # A pty is necessary and not sufficient: Julia also asks whether
+                # the *terminal type* supports line editing, and with `TERM`
+                # unset or `dumb` it prints "Terminal not fully functional" and
+                # falls back to a REPL with no line editor — and therefore no
+                # `]` mode to take over. CI runners have no `TERM`, which is why
+                # this gate timed out there while passing on every developer
+                # machine, where the shell has always set one.
+                cmd = addenv(
+                    `$julia --startup-file=no --history-file=no --banner=no --project=$project -i`,
+                    "TERM" => "xterm-256color",
+                )
                 proc = run(detach(cmd), pts, pts, pts; wait = false)
                 Base.close_stdio(pts)
 
@@ -802,6 +812,13 @@ end
                         # either, so it fails, loudly and by name.
                         if !ok && crashed_in_julias_loader(seen[])
                             @error UPSTREAM_CRASH
+                        elseif !ok && occursin("Terminal not fully functional", seen[])
+                            @error """
+                            The child REPL has no line editor, so there is no `]` to take over.
+                            Julia says so in the transcript above. Give the child a `TERM` its
+                            terminfo knows; this gate sets `xterm-256color` precisely because a
+                            runner has none.
+                            """
                         end
                         @test ok
                         ok || break
